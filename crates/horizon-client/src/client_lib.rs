@@ -18,7 +18,7 @@ pub use horizon_client_render::{
     json_folder, level_loading, light, lod, logging, menu_blur, mesher, minimap, mipmap,
     mod_browser, mod_list, model_library, models, multiline_edit, native_emissive, options_file,
     options_fixes, options_ui, overlay, pack_browser, pack_screen, packs, pad_cursor, par,
-    particles, poi_sections, post_chain, potent_sulfur, preedit, providers, pvp, pvp_hud,
+    particles, platform, poi_sections, post_chain, potent_sulfur, preedit, providers, pvp, pvp_hud,
     screen_draw, screen_effects, sculk, section_mask, server_terrain, settings, shader_options,
     shader_pack_list, signs, skins, sound_engine, sound_events, sound_preview, spans, split_layout,
     split_map, split_profiles, sprites, streaming, structure_block, tab_list, telemetry,
@@ -88,6 +88,7 @@ pub mod locator_bar;
 pub mod lod_net;
 pub mod menu;
 pub mod merchant;
+pub mod mobile;
 pub mod mobs;
 pub mod mod_content;
 pub mod mod_registry;
@@ -138,6 +139,7 @@ pub mod tick_chunk_membership;
 pub mod ticket_levels;
 pub mod title;
 pub mod toasts;
+pub mod touch;
 pub mod ui_theme;
 pub mod vanillagen;
 pub mod voxel_occlusion;
