@@ -148,6 +148,20 @@ const SYMBOLS: [Row; 5] = [
     BOTTOM,
 ];
 
+/// A key's width unit, the gap between keys and a key's height, in `Ui` units.
+const UNIT: f32 = 50.0;
+const GAP: f32 = 6.0;
+const KEY_H: f32 = 38.0;
+
+/// What a point on the keyboard touches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hit {
+    /// The key at this row and column.
+    Key(usize, usize),
+    /// The plate under the keys, between them or around them.
+    Plate,
+}
+
 /// The keyboard's state while open.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Keyboard {
@@ -271,17 +285,57 @@ impl Keyboard {
         }
     }
 
+    /// The keys' top-left corner, and the width and height they and their hint line take,
+    /// on a screen `w` by `h` (in `Ui` units).
+    fn bounds(w: f32, h: f32, at_top: bool) -> (f32, f32, f32, f32) {
+        let width = 10.0 * UNIT + 9.0 * GAP;
+        let height = 5.0 * KEY_H + 4.0 * GAP + 24.0 + 30.0;
+        let x0 = ((w - width) / 2.0).round();
+        let y0 = if at_top { 16.0 } else { h - height - 16.0 };
+        (x0, y0, width, height)
+    }
+
+    /// What a point touches (a tap on a touch screen), with the point and the screen in `Ui`
+    /// units and `at_top` as for [`Keyboard::draw`].
+    pub fn hit(&self, w: f32, h: f32, at_top: bool, x: f32, y: f32) -> Option<Hit> {
+        let (x0, y0, width, height) = Self::bounds(w, h, at_top);
+        // The plate `draw` fills reaches 12 units past the keys on the left, top and right.
+        if x < x0 - 12.0 || x >= x0 + width + 12.0 || y < y0 - 12.0 || y >= y0 - 12.0 + height {
+            return None;
+        }
+        for (r, row) in self.rows().iter().enumerate() {
+            let top = y0 + r as f32 * (KEY_H + GAP);
+            // Rows and keys answer for the gaps beside them, so a tap between keys is not lost.
+            if y < top - GAP / 2.0 || y >= top + KEY_H + GAP / 2.0 {
+                continue;
+            }
+            for (i, (_, units)) in row.iter().enumerate() {
+                let (left, _) = Self::span(row, i);
+                let kx = x0 + left * (UNIT + GAP);
+                let kw = units * UNIT + (units - 1.0) * GAP;
+                if x >= kx - GAP / 2.0 && x < kx + kw + GAP / 2.0 {
+                    return Some(Hit::Key(r, i));
+                }
+            }
+        }
+        Some(Hit::Plate)
+    }
+
+    /// Puts the focus on a key, as the D-pad would.
+    pub fn focus(&mut self, row: usize, col: usize) {
+        if let Some(r) = self.rows().get(row)
+            && col < r.len()
+        {
+            self.row = row;
+            self.col = col;
+        }
+    }
+
     /// Draw the keyboard across the bottom of the screen, or the top when
     /// the field it types into is in the lower half. `by_letter`: the pad goes by its letters
     /// and the glyphs are Nintendo's, so a hint names the button playing its part.
     pub fn draw(&self, ui: &mut Ui, at_top: bool, glyphs: GlyphStyle, by_letter: bool) {
-        const UNIT: f32 = 50.0;
-        const GAP: f32 = 6.0;
-        const KEY_H: f32 = 38.0;
-        let width = 10.0 * UNIT + 9.0 * GAP;
-        let height = 5.0 * KEY_H + 4.0 * GAP + 24.0 + 30.0;
-        let x0 = ((ui.w - width) / 2.0).round();
-        let y0 = if at_top { 16.0 } else { ui.h - height - 16.0 };
+        let (x0, y0, width, height) = Self::bounds(ui.w, ui.h, at_top);
         ui.rounded(
             x0 - 12.0,
             y0 - 12.0,
@@ -376,6 +430,42 @@ mod tests {
                 assert_eq!(units, 10.0);
             }
         }
+    }
+
+    #[test]
+    fn taps_find_the_keys_that_draw_puts_there() {
+        let mut k = Keyboard::default();
+        let (w, h) = (1040.0, 700.0);
+        for at_top in [true, false] {
+            let (x0, y0, width, _) = Keyboard::bounds(w, h, at_top);
+            // The first key of the first row is `1`, at the plate's top-left corner.
+            assert_eq!(
+                k.hit(w, h, at_top, x0 + 5.0, y0 + 5.0),
+                Some(Hit::Key(0, 0))
+            );
+            // The last key of the second row is `p`.
+            assert_eq!(
+                k.hit(w, h, at_top, x0 + width - 5.0, y0 + KEY_H + GAP + 5.0),
+                Some(Hit::Key(1, 9))
+            );
+            // The bottom row's wide Space bar.
+            let bottom = y0 + 4.0 * (KEY_H + GAP) + 5.0;
+            assert_eq!(
+                k.hit(w, h, at_top, x0 + 3.0 * (UNIT + GAP) + 20.0, bottom),
+                Some(Hit::Key(4, 2))
+            );
+            // The plate's margin is the plate; outside it is nothing.
+            assert_eq!(k.hit(w, h, at_top, x0 - 6.0, y0 + 5.0), Some(Hit::Plate));
+            assert_eq!(k.hit(w, h, at_top, x0 - 20.0, y0 + 5.0), None);
+            assert_eq!(k.hit(w, h, at_top, x0 + 5.0, y0 - 20.0), None);
+        }
+        // Tapping a key is focusing it and pressing.
+        k.focus(1, 9);
+        assert_eq!(k.press(), Some(Output::Text("p".into())));
+        // A focus off the grid is ignored.
+        k.focus(9, 0);
+        k.focus(0, 99);
+        assert_eq!(k.press(), Some(Output::Text("p".into())));
     }
 
     #[test]
