@@ -1,0 +1,66 @@
+[package]
+name = "horizon-ios"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+description = "Horizon on iOS: the static library the Xcode app links (ios/README.md)"
+publish = false
+
+# Its own workspace, like android/native and the launcher: the desktop workspace never
+# builds it, and its lock file is seeded from the desktop one so every dependency keeps
+# the version the desktop client is tested with (ios/build-rust.sh does that). The
+# integrator adds `ios` to the root Cargo.toml's `exclude` list; until then this
+# directory is simply not a member of that workspace.
+[workspace]
+
+[lib]
+name = "horizon_ios"
+crate-type = ["staticlib"]
+
+[dependencies]
+# No controllers on iOS: gilrs has no backend for it and a phone's pad comes through
+# the touch controls and Bluetooth keyboards, not evdev. Audio on, like android's default.
+horizon-client = { path = "../crates/horizon-client", default-features = false }
+# The allocator setup `entry::main` runs first thing (`configure_allocator`).
+horizon-threads = { path = "../crates/horizon-threads" }
+# Pinned to the version horizon-client uses: one winit must be linked. The iOS backend
+# needs no feature (plain `EventLoop::new()`, like desktop); there is no
+# `android-native-activity` equivalent on iOS. This crate never calls winit itself —
+# the game loop inside horizon-client creates the event loop.
+winit = { version = "0.30.13", default-features = false }
+log = "0.4"
+
+[features]
+default = ["audio"]
+# Sound through cpal's AudioToolbox backend. Off (`--no-default-features`) if it fails to build or run.
+audio = ["horizon-client/audio"]
+# The system heap instead of mimalloc (the escape hatch if mimalloc ever fails
+# to build for iOS). Mirrors `src/main.rs`'s `system-allocator` feature.
+system-allocator = []
+
+# wgpu-hal 30.0.1 with gfx-rs/wgpu#10124, as in the desktop workspace (see its Cargo.toml),
+# naga 30.0.1 with the GLSL-frontend fixes shader packs need, and libmimalloc-sys 0.1.49
+# with the MSVC/POPCNT fix: the same three patches the desktop workspace carries.
+# (The mimalloc patch matters on iOS only as the version the desktop client is
+# tested with; its fix is for MSVC.)
+[patch.crates-io]
+wgpu-hal = { path = "../third_party/wgpu-hal" }
+naga = { path = "../third_party/naga" }
+libmimalloc-sys = { path = "../third_party/libmimalloc-sys" }
+
+# As the desktop workspace's profiles: line tables keep file:line in backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# A phone has no use for the debug sections: the .ipa would carry them.
+strip = "debuginfo"
+
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
