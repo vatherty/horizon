@@ -1,0 +1,132 @@
+name: ios
+# Builds the iOS app (ios/README.md): on every push to the ios-port branch and on demand.
+# Nothing here needs a secret, a repository variable or any account of the upstream author, so it
+# runs unchanged on a fork. The .ipa is UNSIGNED (SideStore/AltStore signs it on install with a
+# free Apple ID) and holds only the engine; the job fails if it or the repository holds anything
+# of Minecraft's. It is separate from, and never triggered by, the upstream workflows (ci.yml
+# and the others).
+on:
+  push:
+    branches: [ios-port]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  # Nothing of the game may be committed: the tree guard upstream's own hooks run.
+  desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Keep game artifacts out of Git
+        run: |
+          python3 tools/check_public_tree.py
+          python3 tools/check_public_tree.py --history
+
+  ipa:
+    runs-on: macos-15
+    timeout-minutes: 90
+    permissions:
+      # Only to keep the "ios-latest" pre-release below current; nothing else writes.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Keep game artifacts out of Git
+        run: |
+          python3 tools/check_public_tree.py
+          python3 tools/check_public_tree.py --history
+
+      - name: Rust toolchain and the iOS target
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy --target aarch64-apple-ios
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ios
+          shared-key: ios
+          key: ${{ hashFiles('Cargo.lock') }}
+
+      # The gate that can run in CI: the iOS target check (ring and mimalloc need
+      # the iOS SDK, which the macOS runner has; the Linux VM does not).
+      - name: Formatting (ios crate)
+        run: cargo fmt --check --manifest-path ios/Cargo.toml
+      - name: Cargo check for the iOS target
+        run: cargo check --target aarch64-apple-ios --manifest-path ios/Cargo.toml
+      - name: Clippy for the iOS target
+        run: cargo clippy --target aarch64-apple-ios --manifest-path ios/Cargo.toml -- -D warnings
+
+      - name: XcodeGen
+        run: brew install xcodegen
+
+      - name: Build the unsigned .ipa
+        run: ios/build-ipa.sh
+
+      # There is no check_ios_ipa.py yet (the Android tree has check_android_apk.py
+      # but no iOS analogue): the inline check below is the same idea — the .ipa
+      # holds the engine only, never Minecraft's files. If the .ipa ever grows a
+      # checker of its own, this step should call it instead.
+      - name: The .ipa holds only the engine
+        run: |
+          python3 - <<'EOF'
+          import sys, zipfile
+          forbidden_names = {"horizon-resources.json", "horizon-data.bin"}
+          forbidden_suffixes = (".jar", ".class")
+          forbidden_parts = {"assets", "minecraft", ".local"}
+          ipa = "dist/horizon-ios-unsigned.ipa"
+          bad = []
+          with zipfile.ZipFile(ipa) as zf:
+              for info in zf.infolist():
+                  name = info.filename
+                  parts = name.split("/")
+                  if (any(p in forbidden_parts for p in parts)
+                          or name.rsplit("/", 1)[-1] in forbidden_names
+                          or name.lower().endswith(forbidden_suffixes)):
+                      bad.append(name)
+          if bad:
+              print("The .ipa holds game files, refusing it:")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("The .ipa holds only the engine.")
+          EOF
+
+      - name: Name the .ipa after the commit
+        id: name
+        run: |
+          short="${GITHUB_SHA::7}"
+          mv dist/horizon-ios-unsigned.ipa "dist/horizon-ios-unsigned-$short.ipa"
+          echo "file=dist/horizon-ios-unsigned-$short.ipa" >> "$GITHUB_OUTPUT"
+          echo "name=horizon-ios-unsigned-$short" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Upload the .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: ${{ steps.name.outputs.file }}
+          if-no-files-found: error
+          retention-days: 14
+
+      # A fixed download link for the phone: Releases > ios-latest > horizon-ios-unsigned.ipa.
+      # Uses the workflow's own token, so a fork needs no secrets. The .ipa is the engine only (the
+      # content check above has passed by now). Install it with SideStore/AltStore, which signs it
+      # with a free Apple ID; see ios/README.md.
+      - name: Keep the ios-latest pre-release current
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IPA: ${{ steps.name.outputs.file }}
+        run: |
+          cp "$IPA" dist/horizon-ios-unsigned.ipa
+          gh release delete ios-latest --cleanup-tag --yes || true
+          gh release create ios-latest dist/horizon-ios-unsigned.ipa \
+            --target "$GITHUB_SHA" --prerelease \
+            --title "Horizon for iOS (latest build)" \
+            --notes "Unofficial, experimental UNSIGNED build from commit ${GITHUB_SHA::7}. The engine only: no Minecraft files. Install with SideStore/AltStore (it signs the app with a free Apple ID), then import prepared resources from your own Minecraft Java Edition install in the app. See ios/README.md."
