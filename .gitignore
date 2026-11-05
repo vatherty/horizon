@@ -35,3 +35,6 @@
 
 # Release-only compiled original exporter bundle.
 /exporters/
+
+# iOS shell build output (own workspace under ios/)
+ios/target/
