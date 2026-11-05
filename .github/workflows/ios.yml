@@ -68,7 +68,9 @@ jobs:
         run: brew install xcodegen
 
       - name: Build the unsigned .ipa
-        run: ios/build-ipa.sh
+        # `bash` explicitly: the contents API uploads files without the
+        # executable bit, so invoking the script directly would fail.
+        run: bash ios/build-ipa.sh
 
       # There is no check_ios_ipa.py yet (the Android tree has check_android_apk.py
       # but no iOS analogue): the inline check below is the same idea — the .ipa
