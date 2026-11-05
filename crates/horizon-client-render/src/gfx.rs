@@ -2239,12 +2239,12 @@ async fn open_backend(
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         };
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         let attempt = match info.backend {
             wgpu::Backend::Vulkan => horizon_hdr::open_vulkan_device(&adapter, &desc),
             _ => None,
         };
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         let attempt = None;
         let attempt = match attempt {
             Some(attempt) => attempt,
