@@ -253,6 +253,8 @@ pub fn open_latest(dir: &Path) -> io::Result<Option<Latest>> {
     match lock.try_lock() {
         Ok(()) => {}
         Err(fs::TryLockError::WouldBlock) => return Ok(None),
+        // A phone's shared storage can be a file system that has no locks: log without one.
+        Err(fs::TryLockError::Error(_)) if cfg!(any(target_os = "android", target_os = "ios")) => {}
         Err(fs::TryLockError::Error(e)) => return Err(e),
     }
     let mut file = OpenOptions::new()
@@ -401,8 +403,14 @@ fn ours(target: &str) -> bool {
 
 impl log::Log for Logger {
     fn enabled(&self, meta: &log::Metadata) -> bool {
-        meta.level() <= log::Level::Info
-            && (ours(meta.target()) || meta.level() <= log::Level::Error)
+        // On a phone the other crates' warnings (wgpu, the graphics driver) are the only
+        // trace of a graphics problem on a device with no terminal, so they are kept.
+        let other_level = if cfg!(any(target_os = "android", target_os = "ios")) {
+            log::Level::Warn
+        } else {
+            log::Level::Error
+        };
+        meta.level() <= log::Level::Info && (ours(meta.target()) || meta.level() <= other_level)
     }
 
     fn log(&self, record: &log::Record) {
@@ -439,6 +447,18 @@ impl log::Log for Logger {
             _ => {}
         }
         let stderr = ours(record.target()).then(|| message.clone());
+        if crate::platform::has_log_sink() {
+            crate::platform::log_to_sink(
+                match record.level() {
+                    log::Level::Error => 6,
+                    log::Level::Warn => 5,
+                    log::Level::Info => 4,
+                    log::Level::Debug => 3,
+                    log::Level::Trace => 2,
+                },
+                &format!("[{thread}] {message}"),
+            );
+        }
         self.send(thread, level, &message, stderr);
         if gate == Gate::Last {
             self.write(
