@@ -461,7 +461,7 @@ impl Game<'_> {
 
     /// A bound action: a vanilla mapping acts as its default key or mouse
     /// button, like a rebound keyboard key.
-    fn pad_action(&mut self, action: &str, down: bool) -> Result<()> {
+    pub(super) fn pad_action(&mut self, action: &str, down: bool) -> Result<()> {
         let Some(route) = gamepad::route(action) else {
             log::warn!("Horizon: controller action {action} has no handler");
             return Ok(());
@@ -547,6 +547,10 @@ impl Game<'_> {
 
     /// The left stick as the move vector, while playing.
     pub(super) fn pad_move(&self) -> Option<[f32; 2]> {
+        // The touch screen's stick (idle, and never set, off a phone).
+        if let Some(stick) = self.touch_move() {
+            return Some(stick);
+        }
         let settings = &self.settings.controller;
         if !settings.enabled || self.pad_in_menu() || !self.pad_focused() {
             return None;
