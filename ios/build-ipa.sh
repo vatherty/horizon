@@ -30,7 +30,9 @@ need cargo "Install Rust (rustup)."
 
 # ---- the engine: the Rust static library -------------------------------------
 
-"$here/build-rust.sh"
+"# `bash` explicitly: files uploaded through the GitHub contents API lose
+# the executable bit, so invoking the script directly would fail.
+bash "$here/build-rust.sh""
 
 # ---- the app: Xcode project, build, package ----------------------------------
 
