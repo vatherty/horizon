@@ -9,7 +9,9 @@ pub mod wayland;
 /// Opens a Vulkan device with `VK_EXT_hdr_metadata` too, when the GPU offers
 /// it, so [`set_metadata`] can tell the compositor the real peak brightness.
 /// `None` leaves opening to wgpu.
-#[cfg(not(target_os = "macos"))]
+/// Apple targets have no Vulkan backend (wgpu is Metal-only there), so this
+/// is compiled out on macOS and iOS, like the macOS case before it.
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub fn open_vulkan_device(
     adapter: &wgpu::Adapter,
     desc: &wgpu::DeviceDescriptor<'_>,
@@ -57,7 +59,7 @@ pub fn set_metadata(
     peak: f32,
     black: f32,
 ) {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         use wgpu::hal::api::Vulkan;
         // Safety: read-only access to handles wgpu keeps alive while these guards live.
@@ -94,6 +96,6 @@ pub fn set_metadata(
         // Safety: a live swapchain of this device, one metadata entry for it.
         unsafe { loader.set_hdr_metadata(&[swapchain], &[metadata]) };
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     let _ = (device, surface, paper_white, peak, black);
 }
