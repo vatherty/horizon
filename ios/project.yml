@@ -62,7 +62,9 @@ targets:
         # Always runs: cargo itself is a no-op when nothing changed.
         basedOnDependencyAnalysis: false
         script: |
-          "${SRCROOT}/build-rust.sh"
+          # `bash` explicitly: files uploaded through the GitHub contents API
+          # lose the executable bit, so invoking the script directly fails.
+          bash "${SRCROOT}/build-rust.sh"
 schemes:
   Horizon:
     build:
