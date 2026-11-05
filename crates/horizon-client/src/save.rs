@@ -153,8 +153,24 @@ impl SessionLock {
             .create(true)
             .truncate(false)
             .open(world.join("session.lock"))?;
-        file.try_lock()
-            .map_err(|_| format!("{} is already open in another instance", world.display()))?;
+        match file.try_lock() {
+            Ok(()) => {}
+            // A phone's shared storage can be a file system that has no locks: the world opens
+            // without one there, and only another instance of the app could tell the difference.
+            Err(fs::TryLockError::Error(e))
+                if cfg!(any(target_os = "android", target_os = "ios")) =>
+            {
+                log::warn!(
+                    "Horizon: no lock on {} ({e}); opening the world without one",
+                    world.display()
+                );
+            }
+            Err(_) => {
+                return Err(
+                    format!("{} is already open in another instance", world.display()).into(),
+                );
+            }
+        }
         file.set_len(0)?;
         file.write_all(&[0x26, 0x03])?;
         file.flush()?;
