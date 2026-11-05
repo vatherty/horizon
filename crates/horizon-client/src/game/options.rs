@@ -657,6 +657,13 @@ impl Game<'_> {
             .settings
             .horizon
             .battery_limit(limit, self.title.is_none(), self.focused);
+        // A phone that has warmed up draws fewer frames (never a cap off a phone).
+        let limit = match horizon_client::platform::thermal_fps_cap(
+            horizon_client::platform::thermal_status(),
+        ) {
+            Some(cap) => limit.min(cap as i32),
+            None => limit,
+        };
         // A native mod may only lower it (`native_framerate_limit`).
         let mut hooked = limit;
         self.native_framerate_limit(
