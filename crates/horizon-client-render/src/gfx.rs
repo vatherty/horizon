@@ -2215,27 +2215,48 @@ async fn open_backend(
         limits.max_storage_buffer_binding_size,
         limits.max_texture_array_layers,
     ));
-    let desc = wgpu::DeviceDescriptor {
-        label: Some("Horizon device"),
-        required_features: features,
-        required_limits: limits,
-        // Video memory in blocks of 8-64 MiB instead of 128-256 MiB (Vulkan and DirectX 12):
-        // with the larger blocks a few small buffers kept whole blocks the arena's pages had
-        // left, and over half the video memory reserved was unused (1,344 MiB for 500).
-        memory_hints: wgpu::MemoryHints::MemoryUsage,
-        ..Default::default()
-    };
-    #[cfg(not(target_os = "macos"))]
-    let opened = match info.backend {
-        wgpu::Backend::Vulkan => horizon_hdr::open_vulkan_device(&adapter, &desc),
-        _ => None,
-    };
-    #[cfg(target_os = "macos")]
-    let opened = None;
-    let opened = match opened {
-        Some(opened) => opened,
-        None => adapter.request_device(&desc).await,
-    };
+    // A phone's driver may refuse a feature the adapter lists: Android and iOS try again without
+    // the optional ones, which the renderer checks for before it uses them.
+    let mut attempts = vec![features];
+    if cfg!(any(target_os = "android", target_os = "ios")) && !features.is_empty() {
+        attempts.push(wgpu::Features::empty());
+    }
+    let mut opened = None;
+    for (n, required_features) in attempts.into_iter().enumerate() {
+        if n > 0 {
+            log::warn!(
+                "Horizon renderer: the device was refused with the optional features; trying {name} without them (wanted {features:?}, the adapter offers {:?})",
+                adapter.features()
+            );
+        }
+        let desc = wgpu::DeviceDescriptor {
+            label: Some("Horizon device"),
+            required_features,
+            required_limits: limits.clone(),
+            // Video memory in blocks of 8-64 MiB instead of 128-256 MiB (Vulkan and DirectX 12):
+            // with the larger blocks a few small buffers kept whole blocks the arena's pages had
+            // left, and over half the video memory reserved was unused (1,344 MiB for 500).
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            ..Default::default()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let attempt = match info.backend {
+            wgpu::Backend::Vulkan => horizon_hdr::open_vulkan_device(&adapter, &desc),
+            _ => None,
+        };
+        #[cfg(target_os = "macos")]
+        let attempt = None;
+        let attempt = match attempt {
+            Some(attempt) => attempt,
+            None => adapter.request_device(&desc).await,
+        };
+        let ok = attempt.is_ok();
+        opened = Some(attempt);
+        if ok {
+            break;
+        }
+    }
+    let opened = opened.expect("at least one device attempt");
     match opened {
         Ok((device, queue)) => {
             let device_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -4880,6 +4901,30 @@ impl Renderer {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             self.surface.take().and_then(|s| Arc::try_unwrap(s).ok());
+    }
+    /// Whether frames can be drawn: a window surface is attached, or this is an offscreen renderer.
+    pub fn has_surface(&self) -> bool {
+        self.surface.is_some() || self.offscreen.is_some()
+    }
+    /// The window's surface is going away (a phone destroys it when the app goes to the
+    /// background and when the screen changes shape): drops the swapchain before the native
+    /// window it draws to is gone, and draws nothing until [`Renderer::reattach_surface`].
+    pub fn suspend_surface(&mut self) {
+        if self.offscreen.is_some() {
+            return;
+        }
+        self.release_surface();
+        self.suspended = true;
+    }
+    /// A new surface for the window, which is `width` by `height` now. The device, the
+    /// pipelines and every texture stay as they were.
+    pub fn reattach_surface(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.offscreen.is_some() {
+            return Ok(());
+        }
+        self.recreate_surface()?;
+        self.resize(width, height);
+        Ok(())
     }
     /// Reattach a window after surface loss or a failed renderer replacement.
     pub fn recreate_surface(&mut self) -> Result<()> {
