@@ -1333,6 +1333,7 @@ mod tests {
             delivered: false,
             handle: None,
             shown: false,
+            suspended: false,
             ui_at: None,
             title_drawn: false,
             menu: StartupMenu::default(),
