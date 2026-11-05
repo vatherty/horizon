@@ -255,10 +255,10 @@ fn ensure_prepared_symlink(documents: &Path) {
     if prepared.symlink_metadata().is_ok() {
         return;
     }
-    if let Some(parent) = prepared.parent() {
-        if fs::create_dir_all(parent).is_err() {
-            return;
-        }
+    if let Some(parent) = prepared.parent()
+        && fs::create_dir_all(parent).is_err()
+    {
+        return;
     }
     match std::os::unix::fs::symlink("../../resources", &prepared) {
         Ok(()) => log::info!("Horizon: linked {} to resources/", prepared.display()),
@@ -274,10 +274,10 @@ fn ensure_prepared_symlink(documents: &Path) {
 /// this message and offers the import; the code it gets back is
 /// [`EXIT_NO_RESOURCES`].
 fn check_resources(documents: &Path) -> Result<(), String> {
-    if let Some(dir) = args_resources(documents) {
-        if dir.join(MANIFEST).is_file() {
-            return Ok(());
-        }
+    if let Some(dir) = args_resources(documents)
+        && dir.join(MANIFEST).is_file()
+    {
+        return Ok(());
     }
     if resources_dir(documents).join(MANIFEST).is_file() {
         return Ok(());
