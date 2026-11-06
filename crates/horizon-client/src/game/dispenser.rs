@@ -1238,7 +1238,7 @@ impl Game<'_> {
         } else {
             return (self.dispense_default(pos, facing, stack), CLICK);
         };
-        if !self.boat_models.has(&wood, chest) {
+        if !self.model_assets.boat_models.has(&wood, chest) {
             return (self.dispense_default(pos, facing, stack), CLICK);
         }
         self.next_entity += 1;
