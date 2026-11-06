@@ -1856,7 +1856,7 @@ impl wgpu::rwh::HasDisplayHandle for WindowDisplay {
 /// OpenGL. Each is tried when the one before has no surface, adapter or device. A native
 /// crash in the driver can't be
 /// caught in the game; the launcher switches the setting to DirectX 12 after one at
-/// the renderer's start (#746). macOS has Metal only.
+/// the renderer's start (#746). macOS and iOS use Metal.
 fn backend_order(
     api: GraphicsApi,
     os: &str,
@@ -1866,6 +1866,11 @@ fn backend_order(
     use wgpu::Backends;
     if os == "macos" || wgpu_backend {
         return vec![Backends::default()];
+    }
+    // iOS has neither a Vulkan loader nor wgpu's OpenGL backend. Even a
+    // desktop API saved in imported settings must use the phone's Metal GPU.
+    if os == "ios" {
+        return vec![Backends::METAL];
     }
     let windows = os == "windows";
     match api {
@@ -1884,6 +1889,7 @@ fn backends_name(backends: wgpu::Backends) -> &'static str {
         wgpu::Backends::VULKAN => "Vulkan",
         wgpu::Backends::DX12 => "DirectX 12",
         wgpu::Backends::GL => "OpenGL",
+        wgpu::Backends::METAL => "Metal",
         _ => "graphics",
     }
 }
@@ -2290,9 +2296,9 @@ async fn open_backend(
 const NO_GPU_DRIVER: &str = "No graphics driver with Vulkan, DirectX 12 or OpenGL found: Horizon needs \
      a GPU driver with one of them. Install the latest driver for your NVIDIA, AMD or Intel GPU and \
      start the game again";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 const NO_GPU_DRIVER: &str = "No Metal graphics device found";
-#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "ios")))]
 const NO_GPU_DRIVER: &str = "No Vulkan or OpenGL graphics driver found: Horizon needs the Vulkan loader \
      (libvulkan.so.1) and a Vulkan driver for your GPU (Mesa's, or NVIDIA's), or OpenGL through EGL";
 /// Logs a step of the renderer's start, for a native crash in the graphics
@@ -12216,6 +12222,30 @@ mod tests {
                 [Backends::default()]
             );
             assert_eq!(order(api, "macos", "aarch64"), [Backends::default()]);
+        }
+    }
+    #[test]
+    fn ios_uses_metal_for_every_saved_graphics_api() {
+        use super::{GraphicsApi, backend_order, device_search};
+        use wgpu::Backends;
+
+        for api in GraphicsApi::ALL {
+            assert_eq!(
+                backend_order(api, "ios", "aarch64", false),
+                [Backends::METAL]
+            );
+            assert_eq!(
+                device_search(api, "ios", "aarch64", false),
+                [
+                    (vec![Backends::METAL], false),
+                    (vec![Backends::METAL], true)
+                ]
+            );
+            // An explicit WGPU_BACKEND still selects the backend itself.
+            assert_eq!(
+                backend_order(api, "ios", "aarch64", true),
+                [Backends::default()]
+            );
         }
     }
     #[test]
