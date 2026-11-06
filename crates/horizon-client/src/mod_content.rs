@@ -2416,27 +2416,13 @@ fn tables(base: &Path, plan: &Plan, overlay: &Overlay<'_>) -> Result<()> {
         };
         overlay.write(name, &bytes)
     };
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = horizon_threads::worker_count();
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = (0..threads.min(TABLE_THREADS))
-            .map(|_| {
-                scope.spawn(|| -> std::result::Result<(), String> {
-                    loop {
-                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let Some((name, _)) = jobs.get(i) else {
-                            return Ok(());
-                        };
-                        table(name).map_err(|e| e.to_string())?;
-                    }
-                })
-            })
-            .collect();
-        workers.into_iter().try_for_each(|w| {
-            w.join()
-                .unwrap_or_else(|_| Err("a table thread panicked".into()))
-        })
-    })?;
+    horizon_threads::loading::map_limit(&jobs, TABLE_THREADS, |(name, _)| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table(name)))
+            .map_err(|_| "a table thread panicked".to_owned())?
+            .map_err(|e| e.to_string())
+    })
+    .into_iter()
+    .collect::<std::result::Result<Vec<_>, String>>()?;
     Ok(())
 }
 
