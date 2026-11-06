@@ -13,7 +13,7 @@
 //! | render distance | 12 | 6 | chunk meshes and their GPU memory grow with its square |
 //! | simulation distance | 12 | 5 (vanilla's minimum) | mob and block ticking |
 //! | max FPS | 120 | 60 | heat and battery; the limiter lowers it further when the phone warms up |
-//! | mipmap levels | 4 | 2 | texture memory and bandwidth |
+//! | mipmap levels | 4 | 2 | sampled LOD limit; the full texture chain is still allocated |
 //! | biome blend | 2 | 1 | meshing time |
 //! | particles | all | decreased | fill rate |
 //! | entity distance | 100% | 75% | draw calls |
@@ -22,6 +22,11 @@
 //! | menu blur | 5 | 2 | a full-screen blur is expensive on a mobile GPU |
 //! | auto jump | off | on | there is no key to hold for a jump on a touch screen |
 //! | battery mode | off | on | 60 FPS in a world, 30 in menus, half the worker threads |
+//! | world resolution | 100% | 75% | roughly 56% of native world pixels; HUD stays native |
+//!
+//! Resolution scaling adds an intermediate target and a copy. It is not a
+//! guaranteed FPS or RAM improvement. The texture budget limits top-mip color
+//! data, not all texture, Metal, or process memory.
 use std::{fs, io, path::Path};
 
 use crate::graphics::{self, Graphics, Preset};
@@ -44,11 +49,12 @@ pub fn options() -> OptionsFile {
     f
 }
 
-/// Horizon's own graphics settings for a phone: battery mode on, the rest as on the desktop.
+/// Horizon's phone settings: battery mode and a smaller world target, with native HUD.
 pub fn graphics() -> Graphics {
     Graphics {
         preset: Preset::Custom,
         battery: true,
+        resolution_scale: 75,
         ..Graphics::default()
     }
 }
@@ -102,7 +108,7 @@ mod tests {
     fn the_phone_graphics_turn_battery_mode_on() {
         let g = Graphics::parse(&graphics().serialize());
         assert!(g.battery);
-        assert_eq!(g.resolution_scale, 100);
+        assert_eq!(g.resolution_scale, 75);
         assert_eq!(g.preset, Preset::Custom);
     }
 
@@ -114,9 +120,31 @@ mod tests {
         assert!(seed(&dir).unwrap().is_empty(), "nothing is overwritten");
         // The player's own choice survives another start.
         fs::write(dir.join("options.txt"), "version:0\nrenderDistance:20\n").unwrap();
+        fs::write(
+            dir.join(graphics::FILE),
+            "battery:false\nresolutionScale:90\n",
+        )
+        .unwrap();
         assert!(seed(&dir).unwrap().is_empty());
         let text = fs::read_to_string(dir.join("options.txt")).unwrap();
         assert!(text.contains("renderDistance:20"));
+        assert_eq!(
+            fs::read_to_string(dir.join(graphics::FILE)).unwrap(),
+            "battery:false\nresolutionScale:90\n"
+        );
+        // An existing options file does not prevent seeding a missing graphics
+        // file, and the existing file is preserved byte-for-byte.
+        fs::remove_file(dir.join(graphics::FILE)).unwrap();
+        assert_eq!(seed(&dir).unwrap(), [graphics::FILE]);
+        assert_eq!(
+            fs::read_to_string(dir.join("options.txt")).unwrap(),
+            "version:0\nrenderDistance:20\n"
+        );
+        assert_eq!(
+            Graphics::parse(&fs::read_to_string(dir.join(graphics::FILE)).unwrap())
+                .resolution_scale,
+            75
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
