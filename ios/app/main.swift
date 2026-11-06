@@ -17,6 +17,10 @@
 import Foundation
 import UIKit
 
+// Register and sample before Rust starts winit's UIKit loop. The singleton and
+// its notification tokens stay alive throughout either app phase.
+PlatformPowerMonitor.shared.start()
+
 // The game folder: the app's Documents directory. The Rust side takes it as a
 // C string rather than asking the OS itself, so there is exactly one place
 // that decides where the game lives.
