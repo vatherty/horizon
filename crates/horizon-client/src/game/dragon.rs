@@ -3060,7 +3060,10 @@ impl Game<'_> {
         out: &mut Vec<Vertex>,
         additive: &mut Vec<Vertex>,
     ) {
-        let (Some(d), Some(model)) = (self.dragon.as_ref(), self.dragon_model.as_ref()) else {
+        let (Some(d), Some(model)) = (
+            self.dragon.as_ref(),
+            self.model_assets.dragon_model.as_ref(),
+        ) else {
             return;
         };
         let a = alpha as f32;
