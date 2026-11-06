@@ -1576,6 +1576,7 @@ version = "0.1.0"
 dependencies = [
  "horizon-client-core",
  "horizon-core",
+ "horizon-threads",
  "horizon-world",
  "log",
  "serde",
@@ -1791,6 +1792,7 @@ version = "0.1.0"
 name = "horizon-threads"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "libc",
  "libmimalloc-sys",
  "mimalloc",
