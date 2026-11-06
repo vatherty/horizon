@@ -47,6 +47,7 @@ mod entity_batch;
 mod entity_outline;
 #[cfg(test)]
 mod inter_stage_tests;
+mod surface_lifecycle;
 #[cfg(test)]
 pub(crate) mod test_gpu;
 mod weather;
@@ -58,6 +59,7 @@ pub use entity_batch::{
     TRANSLUCENT_PARTICLE_OVERLAY, WATER_MASK_OVERLAY, WORLD_TEXT_OVERLAY,
     WORLD_TEXT_POLYGON_OFFSET_OVERLAY, mark_oit,
 };
+use surface_lifecycle::{SurfaceLifecycle, Target as SurfaceTarget, drawable_size};
 pub use view::{View, ViewSet};
 
 /// Window.getAppropriateLineWidth, in framebuffer pixels.
@@ -171,6 +173,7 @@ mod hdr_stats;
 pub use hdr::Calibration as HdrCalibration;
 pub mod block_light;
 mod displace;
+mod dynamic_resolution;
 pub mod lightning;
 mod lod;
 mod native_material;
@@ -182,6 +185,7 @@ mod native_sky;
 mod occlusion;
 mod oit;
 mod oit_features;
+mod overlay_depth;
 mod pack_atlas;
 mod pack_center_depth;
 pub mod pack_draw;
@@ -207,10 +211,28 @@ mod sunrise_fan;
 mod timing;
 pub mod translucency;
 pub(crate) mod upload;
+pub use upload::MeshUploadBudget;
 mod view;
 mod visbuffer;
 mod wgsl_prefix;
 mod world_post;
+pub use timing::GpuTimingStats;
+
+/// Cheap local performance observations. Arena bytes are resource capacities,
+/// not physical process or driver allocations, and overlap OS observations.
+#[derive(Clone, Copy, Debug)]
+pub struct PerformanceSummary {
+    pub backend: wgpu::Backend,
+    pub output_size: [u32; 2],
+    pub world_size: [u32; 2],
+    pub color_format: wgpu::TextureFormat,
+    pub world_scale: f32,
+    pub resident_sections: usize,
+    pub arena_capacity_bytes: u64,
+    pub timing_supported: bool,
+    pub timing: GpuTimingStats,
+    pub resolution_changes: u64,
+}
 pub mod world_primitives;
 
 /// A section's instance: its camera-relative origin and, in `w`, the step of
@@ -1029,6 +1051,19 @@ pub struct ScreenshotRequest {
     /// `Renderer::screenshot_quality`, not the window's.
     pub scaled: bool,
 }
+/// The device, immutable pipeline cache and transferable surface needed by a
+/// replacement renderer. It holds no old atlases, arenas or frame targets.
+pub struct RendererSeed {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    device_lost: Arc<std::sync::atomic::AtomicBool>,
+    reuse: Arc<reuse::Reuse>,
+    spare_surface: Option<wgpu::Surface<'static>>,
+    present_mode: wgpu::PresentMode,
+}
+
 pub struct Renderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -1041,6 +1076,7 @@ pub struct Renderer {
     spare_surface: std::sync::Mutex<Option<wgpu::Surface<'static>>>,
     /// The offscreen colour target, sized like `config`.
     offscreen: Option<wgpu::Texture>,
+    surface_lifecycle: SurfaceLifecycle,
     /// Offscreen submissions still on the GPU: at most two frames run ahead.
     in_flight: std::collections::VecDeque<wgpu::SubmissionIndex>,
     /// Splitscreen: the caller waits for the GPU once every player has submitted
@@ -1050,6 +1086,8 @@ pub struct Renderer {
     /// (see `startup_step`).
     first_frame: FirstFrame,
     gpu_timer: Option<timing::GpuTimer>,
+    gpu_timing: timing::Sampling,
+    gpu_feedback_world: bool,
     /// GPU frame times (ms) read back since the caller last drained them.
     pub gpu_times: Vec<f32>,
     /// The last lightmap written, RGBA rows of sky level by block level
@@ -1362,6 +1400,8 @@ pub struct Renderer {
     layout: crate::chunk::ColumnLayout,
     /// Resolution scale, FXAA and TAA (Horizon settings).
     world_post: world_post::Post,
+    dynamic_resolution: dynamic_resolution::Controller,
+    overlay_depth: overlay_depth::OverlayDepth,
     /// Frame generation (Horizon setting).
     frame_gen: frame_gen::FrameGen,
     /// The entities' texture atlas (`entity_group`'s), for frame generation's motion.
@@ -1486,7 +1526,13 @@ fn adapter_requested_split(info: &wgpu::AdapterInfo, requested: Option<u32>) -> 
 }
 /// The split the CPU mip chains are cut by before the adapter is known.
 fn sprite_split() -> u32 {
-    requested_split().unwrap_or(SPRITE_SPLIT)
+    preparation_split(
+        cfg!(any(target_os = "macos", target_os = "ios")),
+        requested_split(),
+    )
+}
+fn preparation_split(metal: bool, requested: Option<u32>) -> u32 {
+    requested.unwrap_or(if metal { 512 } else { SPRITE_SPLIT })
 }
 /// The block sprite layers per texture array on an adapter that holds
 /// `max_layers` layers per array: [`SPRITE_SPLIT`], `requested`
@@ -1721,17 +1767,35 @@ impl PreparedTextures {
             return self;
         }
         let levels = self.sprites[0].1;
-        let all: Vec<u8> = self
-            .sprites
-            .drain(..)
-            .flat_map(|(bytes, _)| bytes)
-            .collect();
         // Every layer's mip levels are contiguous (layer major).
-        let layer_bytes = all.len() / layers as usize;
-        self.sprites = all
-            .chunks(layer_bytes * split as usize)
-            .map(|chunk| (chunk.to_vec(), levels))
-            .collect();
+        let layer_bytes =
+            self.sprites.iter().map(|(b, _)| b.len()).sum::<usize>() / layers as usize;
+        let mut sources = self.sprites.into_iter();
+        let mut source = sources.next().map(|(b, _)| b).unwrap_or_default();
+        let mut offset = 0;
+        let mut arrays = Vec::with_capacity(layers.div_ceil(split) as usize);
+        for array in 0..layers.div_ceil(split) {
+            let bytes = (layers - array * split).min(split) as usize * layer_bytes;
+            // Aligned arrays keep their allocation. Otherwise only the next
+            // destination array is copied; never concatenate the whole atlas.
+            let data = if offset == 0 && source.len() == bytes {
+                std::mem::take(&mut source)
+            } else {
+                let mut data = Vec::with_capacity(bytes);
+                while data.len() < bytes {
+                    if offset == source.len() {
+                        source = sources.next().expect("prepared sprite layers").0;
+                        offset = 0;
+                    }
+                    let take = (bytes - data.len()).min(source.len() - offset);
+                    data.extend_from_slice(&source[offset..offset + take]);
+                    offset += take;
+                }
+                data
+            };
+            arrays.push((data, levels));
+        }
+        self.sprites = arrays;
         self.split = split;
         self
     }
@@ -1942,14 +2006,6 @@ fn check_layers(adapter: &wgpu::Adapter, layers: u32) -> Result<u32> {
         adapter_requested_split(&info, requested_split()),
         layers,
     )?)
-}
-/// Whether the swapchain can take a window of `width` x `height`: each side from 1 to the
-/// device's `max_texture_dimension_2d` (`max`), else `Surface::configure` panics. 0 is a
-/// minimized window. Past `max`: Windows lets a program size a window up to 65535 pixels
-/// (`SetWindowPos`), a 984x65496 client area, when an RTX 5080 takes 32768. Vanilla's
-/// `Window.onFramebufferResize` likewise keeps the last size for one that is not positive.
-fn drawable_size(width: u32, height: u32, max: u32) -> bool {
-    (1..=max).contains(&width) && (1..=max).contains(&height)
 }
 /// The swapchain format: a non-sRGB target, because vanilla blends and tints in gamma
 /// space, and 8-bit, because wgpu gives `Rgba16Float` the linear `ExtendedSrgb` color
@@ -2320,6 +2376,60 @@ fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 impl Renderer {
+    pub fn performance_summary(&self) -> PerformanceSummary {
+        PerformanceSummary {
+            backend: self.adapter.get_info().backend,
+            output_size: [self.config.width, self.config.height],
+            world_size: self
+                .world_post
+                .size()
+                .unwrap_or([self.config.width, self.config.height]),
+            color_format: self.frame_format,
+            world_scale: self.world_post.scale,
+            resident_sections: self.sections.len(),
+            arena_capacity_bytes: self.arena.bytes()
+                + self
+                    .translucent_arena
+                    .as_ref()
+                    .map_or(0, arena::Arena::bytes)
+                + self.sorted_indices.bytes(),
+            timing_supported: self
+                .device
+                .features()
+                .contains(wgpu::Features::TIMESTAMP_QUERY),
+            timing: self
+                .gpu_timer
+                .as_ref()
+                .map_or_else(Default::default, |t| t.stats),
+            resolution_changes: self.dynamic_resolution.changes,
+        }
+    }
+    /// Retain just what reconstruction needs. Call `release_surface` first to
+    /// transfer a live window's surface; the old renderer can then be dropped
+    /// without waiting for the GPU, which retains submitted resources itself.
+    /// Resource reloads may keep their old renderer until the build succeeds.
+    pub fn reuse_seed(&self) -> RendererSeed {
+        RendererSeed {
+            instance: self.instance.clone(),
+            adapter: self.adapter.clone(),
+            device: self.device.clone(),
+            queue: self.queue.clone(),
+            device_lost: self.device_lost.clone(),
+            reuse: self.reuse.clone(),
+            spare_surface: self
+                .spare_surface
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+            present_mode: self.config.present_mode,
+        }
+    }
+    /// Validate before transferring a spare surface so a rejected resource
+    /// pack leaves the previous renderer's recovery surface available.
+    pub fn reuse_seed_for_layers(&self, layers: u32) -> Result<RendererSeed> {
+        check_layers(&self.adapter, layers)?;
+        Ok(self.reuse_seed())
+    }
     /// Sections with GPU buffers, for soak tests watching residency.
     pub fn resident_sections(&self) -> usize {
         self.sections.len()
@@ -2470,6 +2580,59 @@ impl Renderer {
         wide_frame: bool,
         shader_pack: bool,
     ) -> Result<Self> {
+        Self::new_with_seed(
+            window,
+            offscreen,
+            sprite_pixels,
+            sprite_size,
+            sprite_minimum_size,
+            layers,
+            sprite_mips,
+            animations,
+            hud_atlas,
+            glint,
+            glint_armor,
+            forcefield,
+            panorama_faces,
+            prepared,
+            previous
+                .map(|r| r.reuse_seed_for_layers(layers))
+                .transpose()?,
+            api,
+            translucent_batching,
+            wide_frame,
+            shader_pack,
+        )
+        .await
+    }
+
+    /// Build on the retained device after the obsolete renderer has been dropped.
+    pub async fn new_with_seed(
+        window: Arc<Window>,
+        offscreen: bool,
+        sprite_pixels: &[u8],
+        sprite_size: u32,
+        sprite_minimum_size: u32,
+        layers: u32,
+        sprite_mips: &[crate::mipmap::Settings],
+        animations: &[SpriteAnimation],
+        hud_atlas: (&[u8], u32, u32),
+        glint: (&[u8], u32, u32),
+        glint_armor: (&[u8], u32, u32),
+        forcefield: (&[u8], u32),
+        panorama_faces: Arc<panorama::Faces>,
+        prepared: Option<PreparedTextures>,
+        previous: Option<RendererSeed>,
+        api: GraphicsApi,
+        translucent_batching: bool,
+        wide_frame: bool,
+        shader_pack: bool,
+    ) -> Result<Self> {
+        let reused = previous.is_some();
+        let present_mode = previous.as_ref().map(|r| r.present_mode);
+        let reuse = previous
+            .as_ref()
+            .map_or_else(Default::default, |r| r.reuse.clone());
         let Opened {
             instance,
             surface,
@@ -2481,18 +2644,14 @@ impl Renderer {
             // Reload resources on the same device; replacing live Vulkan
             // devices can invalidate the driver's swapchain state on the same
             // window.
-            Some(renderer) => {
+            Some(mut renderer) => {
                 describe_adapter(&renderer.adapter);
                 check_layers(&renderer.adapter, layers)?;
                 Opened {
                     surface: if offscreen {
                         None
                     } else {
-                        let spare = renderer
-                            .spare_surface
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take();
+                        let spare = renderer.spare_surface.take();
                         Some(match spare {
                             Some(surface) => surface,
                             None => renderer.instance.create_surface(window.clone())?,
@@ -2539,8 +2698,7 @@ impl Renderer {
             if caps.usages.contains(wgpu::TextureUsages::COPY_DST) {
                 config.usage |= wgpu::TextureUsages::COPY_DST;
             }
-            config.present_mode = previous
-                .map(|renderer| renderer.config.present_mode)
+            config.present_mode = present_mode
                 .filter(|mode| caps.present_modes.contains(mode))
                 .unwrap_or_else(|| {
                     if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
@@ -2549,7 +2707,7 @@ impl Renderer {
                         wgpu::PresentMode::Fifo
                     }
                 });
-            if previous.is_none() {
+            if !reused {
                 startup_step(format_args!(
                     "device ready; configuring the surface ({}x{} {:?}, {:?})",
                     config.width, config.height, config.format, config.present_mode
@@ -2558,7 +2716,7 @@ impl Renderer {
             surface.configure(&device, &config);
             let hdr_output = hdr::output(&caps);
             crate::graphics::offer_hdr(hdr_output.is_some());
-            if previous.is_none() {
+            if !reused {
                 log::info!(
                     "Horizon renderer: HDR output {}",
                     hdr_output.map_or("not offered by this display", hdr::Output::name)
@@ -2585,7 +2743,7 @@ impl Renderer {
             // window's renderer offers what its display does.
             if let Some(output) = hdr_output {
                 crate::graphics::offer_hdr(true);
-                if previous.is_none() {
+                if !reused {
                     log::info!(
                         "Horizon renderer: HDR output {} offscreen (HORIZON_HDR_OUTPUT)",
                         output.name()
@@ -2594,6 +2752,8 @@ impl Renderer {
             }
             (config, Vec::new(), hdr_output)
         };
+        let surface_lifecycle =
+            SurfaceLifecycle::new(offscreen, [size.width, size.height], max_side);
         let offscreen = surface
             .is_none()
             .then(|| Self::offscreen_target(&device, &config));
@@ -2603,17 +2763,17 @@ impl Renderer {
         );
         crate::graphics::offer_smooth_gradients(wide_ok);
         let frame_format = frame_format(wide_frame, hdr_output.is_some(), wide_ok, config.format);
-        if previous.is_none() {
+        if !reused {
             startup_step(format_args!("creating the pipelines"));
         }
         // A renderer on the same device takes the previous one's shader
         // modules, layouts and pipelines where they come out the same.
-        let reuse = previous.map_or_else(Default::default, |r| r.reuse.clone());
         let generation = reuse.begin();
         let kept = reuse.on(&device);
         let pipelines_step = crate::spans::startup::step("renderer.pipelines_textures");
         let terrain_step = crate::spans::startup::step("renderer.terrain_pipelines");
-        let gpu_timer = timing::GpuTimer::new(&device, &queue);
+        // Timing adds passes on Metal; allocate and encode only on request.
+        let gpu_timer = None;
         let shader = kept.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon terrain"),
             source: wgpu::ShaderSource::Wgsl(include_str!("terrain.wgsl").into()),
@@ -3356,7 +3516,7 @@ impl Renderer {
             label: Some("Horizon entities"),
             source: wgpu::ShaderSource::Wgsl(entity_shader().into()),
         });
-        let static_entity_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let static_entity_shader = kept.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Horizon static block entities"),
             source: wgpu::ShaderSource::Wgsl(static_entity_shader().into()),
         });
@@ -3426,7 +3586,7 @@ impl Renderer {
             ],
         });
         let static_entity_bindings =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            kept.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Static block-entity transform"),
                 entries: &[entry(
                     0,
@@ -3542,7 +3702,7 @@ impl Renderer {
             bind_group_layouts: &[Some(&entity_bindings)],
             ..Default::default()
         });
-        let static_entity_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let static_entity_layout = kept.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Static block-entity layout"),
             bind_group_layouts: &[Some(&entity_bindings), Some(&static_entity_bindings)],
             ..Default::default()
@@ -3805,41 +3965,40 @@ impl Renderer {
             alpha_blend,
             false,
         );
-        let static_entity_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Static block entities"),
-                layout: Some(&static_entity_layout),
-                vertex: wgpu::VertexState {
-                    module: &static_entity_shader,
-                    entry_point: Some("vs_static_entity"),
-                    compilation_options: Default::default(),
-                    buffers: &static_entity_vertex,
-                },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: Default::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &static_entity_shader,
-                    entry_point: Some("fs_entity"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: frame_format,
-                        // fs_entity's discard handles binary cutout alpha. Any
-                        // sprite with fractional alpha stays on the blended
-                        // dynamic entity path.
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+        let static_entity_pipeline = kept.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Static block entities"),
+            layout: Some(&static_entity_layout),
+            vertex: wgpu::VertexState {
+                module: &static_entity_shader,
+                entry_point: Some("vs_static_entity"),
+                compilation_options: Default::default(),
+                buffers: &static_entity_vertex,
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &static_entity_shader,
+                entry_point: Some("fs_entity"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: frame_format,
+                    // fs_entity's discard handles binary cutout alpha. Any
+                    // sprite with fractional alpha stays on the blended
+                    // dynamic entity path.
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
         // RenderPipelines.ENERGY_SWIRL: BlendFunction.ADDITIVE (one, one), no culling; no depth
         // writes either: vanilla sorts the quads far to near, so every face passes the test.
         let one_one = wgpu::BlendComponent {
@@ -4498,6 +4657,7 @@ impl Renderer {
             });
         let depth = Self::depth(&device, &config);
         let world_post = world_post::Post::new(&device, frame_format);
+        let overlay_depth = overlay_depth::OverlayDepth::new(&adapter);
         let uploads = upload::Uploads::new(&device);
         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
         let stars = stars::Stars::new(&device, frame_format);
@@ -4509,13 +4669,13 @@ impl Renderer {
         let panorama = panorama::Panorama::new(&device, frame_format, panorama_faces);
         drop(pipelines_step);
         reuse.finish(generation);
-        if previous.is_some() {
+        if reused {
             log::info!(
                 "Horizon renderer: rebuilt on the same device ({} shader modules, layouts and pipelines kept)",
                 reuse.len()
             );
         }
-        if previous.is_none() {
+        if !reused {
             startup_step(format_args!(
                 "pipelines ready (multi-draw {}, occlusion culling {}, GPU culling {}, GPU timer {})",
                 on_off(multi_draw),
@@ -4537,14 +4697,17 @@ impl Renderer {
             surface: surface.map(Arc::new),
             spare_surface: std::sync::Mutex::new(None),
             offscreen,
+            surface_lifecycle,
             in_flight: std::collections::VecDeque::new(),
             paced_elsewhere: false,
-            first_frame: if previous.is_none() {
+            first_frame: if !reused {
                 FirstFrame::Acquire
             } else {
                 FirstFrame::Drawn
             },
             gpu_timer,
+            gpu_timing: timing::Sampling::from_environment(),
+            gpu_feedback_world: false,
             gpu_times: Vec::new(),
             lightmap_pixels: [0; 16 * 16 * 4],
             last_wait: std::time::Duration::ZERO,
@@ -4729,6 +4892,8 @@ impl Renderer {
             occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
             layout: crate::chunk::ColumnLayout::VANILLA,
             world_post,
+            dynamic_resolution: dynamic_resolution::Controller::from_environment(),
+            overlay_depth,
             frame_gen: frame_gen::FrameGen::new(),
             entity_atlas: atlas_view.clone(),
             hdr: None,
@@ -4910,34 +5075,51 @@ impl Renderer {
     }
     /// Whether frames can be drawn: a window surface is attached, or this is an offscreen renderer.
     pub fn has_surface(&self) -> bool {
-        self.surface.is_some() || self.offscreen.is_some()
+        !self.suspended
+            && match self.surface_lifecycle.target() {
+                SurfaceTarget::Native => self.surface.is_some(),
+                SurfaceTarget::Offscreen => self.offscreen.is_some(),
+                SurfaceTarget::Detached => false,
+            }
     }
     /// The window's surface is going away (a phone destroys it when the app goes to the
     /// background and when the screen changes shape): drops the swapchain before the native
     /// window it draws to is gone, and draws nothing until [`Renderer::reattach_surface`].
     pub fn suspend_surface(&mut self) {
-        if self.offscreen.is_some() {
+        if !self.surface_lifecycle.detach() {
             return;
         }
         self.release_surface();
+        // A suspended native window cannot be retained as a replacement spare.
+        self.spare_surface
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.suspended = true;
     }
     /// A new surface for the window, which is `width` by `height` now. The device, the
     /// pipelines and every texture stay as they were.
     pub fn reattach_surface(&mut self, width: u32, height: u32) -> Result<()> {
-        if self.offscreen.is_some() {
+        if self.surface_lifecycle.target() == SurfaceTarget::Offscreen {
             return Ok(());
         }
-        self.recreate_surface()?;
+        self.surface_lifecycle.attach();
         self.resize(width, height);
+        if self.surface.is_none()
+            && let Err(error) = self.recreate_surface()
+        {
+            self.surface_lifecycle.detach();
+            self.suspended = true;
+            return Err(error);
+        }
         Ok(())
     }
     /// Reattach a window after surface loss or a failed renderer replacement.
     pub fn recreate_surface(&mut self) -> Result<()> {
-        self.queue.wait();
-        if self.offscreen.is_some() {
+        if self.surface_lifecycle.target() != SurfaceTarget::Native {
             return Ok(());
         }
+        self.queue.wait();
         // The surface set aside for a replacement that failed, else a new one
         // (Wayland allows only one tearing-control object per window surface,
         // so the old one goes first).
@@ -4952,19 +5134,25 @@ impl Renderer {
             Some(surface) => surface,
             None => self.instance.create_surface(self.window.clone())?,
         };
-        let configured = Self::configure(
-            &self.device,
-            &surface,
-            &self.surface_config(),
-            self.hdr.as_ref(),
-            &self.device_lost,
-        );
+        // A zero-sized resume may attach the native handle, but cannot allocate
+        // a swapchain until a drawable resize arrives.
+        let configured = if self.suspended {
+            Ok(())
+        } else {
+            Self::configure(
+                &self.device,
+                &surface,
+                &self.surface_config(),
+                self.hdr.as_ref(),
+                &self.device_lost,
+            )
+        };
         if let Err(e) = &configured {
             log::warn!(
                 "Horizon renderer: the new window surface did not configure ({e}); retrying"
             );
         }
-        self.surface_unconfigured = configured.is_err();
+        self.surface_unconfigured = self.suspended || configured.is_err();
         self.surface = Some(Arc::new(surface));
         Ok(())
     }
@@ -5028,16 +5216,19 @@ impl Renderer {
     /// ([`drawable_size`]) keeps the last one and draws nothing until the next.
     pub fn resize(&mut self, width: u32, height: u32) {
         let max = self.device.limits().max_texture_dimension_2d;
-        self.suspended = !drawable_size(width, height, max);
-        if self.suspended {
+        let target = self.surface_lifecycle.resize([width, height], max);
+        self.suspended = self.surface_lifecycle.suspended();
+        let Some(target) = target else {
             return;
-        }
+        };
         self.config.width = width;
         self.config.height = height;
-        if self.surface.is_some() {
-            self.configure_surface();
-        } else {
-            self.offscreen = Some(Self::offscreen_target(&self.device, &self.config));
+        match target {
+            SurfaceTarget::Native => self.configure_surface(),
+            SurfaceTarget::Offscreen => {
+                self.offscreen = Some(Self::offscreen_target(&self.device, &self.config));
+            }
+            SurfaceTarget::Detached => unreachable!("detached resizes retain all targets"),
         }
         self.depth = Self::depth(&self.device, &self.config);
     }
@@ -6409,10 +6600,14 @@ impl Renderer {
     /// `upscale`: output pixels per rendered pixel, for TAA to rebuild (1: native).
     pub fn set_world_post(&mut self, scale: f32, antialias: bool, taa: bool, upscale: f32) {
         let taa = taa && self.world_post.supports_taa();
-        self.world_post.scale = scale.clamp(0.25, 2.0);
+        self.world_post.scale = self.dynamic_resolution.set_ceiling(scale);
         self.world_post.antialias = antialias && !taa;
         self.world_post.taa = taa;
         self.world_post.upscale = if taa { upscale.clamp(1.0, 4.0) } else { 1.0 };
+    }
+    /// The effective FPS cap's GPU budget for the optional resolution experiment.
+    pub fn set_dynamic_frame_budget(&mut self, fps: u32) {
+        self.dynamic_resolution.set_budget(fps);
     }
     /// Runs `post` over the world from now on (`None`: no pack), for the dimension `dimension`;
     /// `block_ids` gives each block sprite layer's `mc_Entity` (id, fluid) and `at_midBlock.w`
@@ -6688,6 +6883,7 @@ impl Renderer {
     /// with `HORIZON_SHADER_PACK_TIMING`.
     pub fn set_pass_timing(&mut self, on: bool) {
         self.pass_timing = on || pack_timing::PassTiming::logging();
+        self.gpu_timing.demand = self.pass_timing;
     }
     /// The running shader pack's timer, of either kind.
     fn pass_timer<'a>(
@@ -7085,6 +7281,7 @@ impl Renderer {
         let mut laps = crate::spans::laps();
         let landing = Instant::now();
         self.land_frame();
+        self.gpu_feedback_world = !frame.title && checks.is_none();
         // Waiting for the previous frame (offscreen: at most two on the GPU), not work.
         let landed = landing.elapsed();
         self.queue.take_waited();
@@ -8878,8 +9075,15 @@ impl Renderer {
             format: Some(self.frame_format),
             ..Default::default()
         });
+        let sample_gpu = self
+            .gpu_timing
+            .next(self.dynamic_resolution.enabled && self.gpu_feedback_world);
+        if sample_gpu && self.gpu_timer.is_none() {
+            self.gpu_timer = timing::GpuTimer::new(&self.device, &self.queue);
+        }
         if let Some(timer) = &mut self.gpu_timer {
-            timer.begin(&mut encoder);
+            // Pending samples still resolve when this frame is not measured.
+            timer.begin(&mut encoder, sample_gpu, self.gpu_feedback_world);
         }
         // The frame's statistics (`show_stats`): a CPU frame's at once; a GPU frame's when the
         // pass's counts come back, with the CPU's part of it: the sections the walk listed but
@@ -10696,8 +10900,8 @@ impl Renderer {
         }
         if let Some(timer) = &mut self.gpu_timer {
             timer.submitted(&self.queue);
-            timer.collect(&self.device, &mut self.gpu_times);
         }
+        self.collect_gpu_times();
         if let Some(Some(timer)) = Self::pass_timer(&mut self.pack_post, &mut self.native) {
             timer.submitted(&self.queue);
         }
@@ -10805,6 +11009,15 @@ impl Renderer {
             hdr.keep_world(encoder, timing.as_mut());
         }
         if overlay.hand_quads > 0 {
+            // A scaled world owns a separate depth target. The native-sized
+            // hand depth is clear/discard in one pass unless HDR reads it.
+            let hand_depth = if !overlay.world_depth && self.hdr.is_none() {
+                self.overlay_depth
+                    .view(&self.device, [self.config.width, self.config.height])
+            } else {
+                None
+            }
+            .unwrap_or(&self.depth);
             let attachments = [Some(wgpu::RenderPassColorAttachment {
                 view: view_target,
                 resolve_target: None,
@@ -10819,7 +11032,7 @@ impl Renderer {
                 timestamp_writes: timing.as_mut().and_then(|t| t.writes("Hand")),
                 color_attachments: &attachments,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
+                    view: hand_depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(0.0),
                         // HDR output's hand marks test against it (below).
@@ -11202,8 +11415,8 @@ impl Renderer {
         let submission = self.queue.landed();
         if let Some(timer) = &mut self.gpu_timer {
             timer.submitted(&self.queue);
-            timer.collect(&self.device, &mut self.gpu_times);
         }
+        self.collect_gpu_times();
         if let Some(Some(timer)) = Self::pass_timer(&mut self.pack_post, &mut self.native) {
             timer.submitted(&self.queue);
         }
@@ -11212,6 +11425,20 @@ impl Renderer {
             if !self.paced_elsewhere {
                 self.wait_frames();
             }
+        }
+    }
+    fn collect_gpu_times(&mut self) {
+        let now = self.started.elapsed();
+        let dynamic = &mut self.dynamic_resolution;
+        let world_post = &mut self.world_post;
+        if let Some(timer) = &mut self.gpu_timer {
+            timer.collect(&self.device, &mut self.gpu_times, |ms, feedback| {
+                if feedback && let Some(scale) = dynamic.observe(ms, now) {
+                    // World targets are replaced lazily at the next frame, at
+                    // most once per five seconds after sustained GPU pressure.
+                    world_post.scale = scale;
+                }
+            });
         }
     }
     /// No swapchain paces offscreen frames: keep two on the GPU at most.
@@ -13195,6 +13422,30 @@ mod sprite_upload_tests {
                 .resplit(layers, to);
                 assert_eq!(resplit.split, to);
                 assert_eq!(resplit.sprites, direct.sprites, "{split} -> {to}");
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_texture_partition_boundaries_preserve_companion_maps() {
+        assert_eq!(preparation_split(true, None), 512);
+        assert_eq!(preparation_split(false, None), 2048);
+        assert_eq!(preparation_split(true, Some(1024)), 1024);
+        for layers in [511, 512, 513, 2047, 2048, 2049] {
+            let pixels: Vec<u8> = (0..layers * 4)
+                .flat_map(|i| [i as u8, (i / 255) as u8, 97, 255])
+                .collect();
+            let border = [3, 4, 5, 255].repeat(4);
+            let make = |split| {
+                PreparedTextures::with_split(&pixels, 2, layers, &[], (&border, 2), split)
+                    .with_pbr(&pixels, &pixels, 2, layers)
+            };
+            for (from, to) in [(2048, 512), (512, 2048), (512, 511)] {
+                let direct = make(to);
+                let resplit = make(from).resplit(layers, to);
+                assert_eq!(resplit.sprites, direct.sprites, "{layers}: {from}->{to}");
+                assert_eq!(resplit.pbr, direct.pbr);
+                assert_eq!(resplit.forcefield, direct.forcefield);
             }
         }
     }
