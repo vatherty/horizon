@@ -1155,13 +1155,13 @@ impl Game<'_> {
             (
                 m.extra.arrow_count,
                 false,
-                self.arrow_model.as_ref(),
+                self.model_assets.arrow_model.as_ref(),
                 "entity/projectiles/arrow",
             ),
             (
                 m.extra.stinger_count,
                 true,
-                self.bee_stinger_model.as_ref(),
+                self.model_assets.bee_stinger_model.as_ref(),
                 "entity/bee/bee_stinger",
             ),
         ];
