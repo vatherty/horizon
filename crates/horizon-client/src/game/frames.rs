@@ -583,10 +583,10 @@ impl Game<'_> {
             };
             if !f.invisible {
                 let model = match (f.glow, map.is_some()) {
-                    (true, true) => &self.glow_map_frame_model,
-                    (false, true) => &self.map_frame_model,
-                    (true, false) => &self.glow_frame_model,
-                    (false, false) => &self.frame_model,
+                    (true, true) => &self.model_assets.glow_map_frame_model,
+                    (false, true) => &self.model_assets.map_frame_model,
+                    (true, false) => &self.model_assets.glow_frame_model,
+                    (false, false) => &self.model_assets.frame_model,
                 };
                 for (corners, uv, sprite) in model {
                     let Some(r) = sprites.get(sprite) else {
