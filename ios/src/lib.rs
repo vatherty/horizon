@@ -36,6 +36,7 @@ use std::ffi::{CStr, c_char, c_int};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use horizon_client::{crash, logging};
 
@@ -61,9 +62,23 @@ const MANIFEST: &str = "horizon-resources.json";
 /// The prepared folder's version (horizon-core's `VANILLA_VERSION`, `26.3`).
 const PREPARED_VERSION: &str = "26.3";
 
+/// Apple's thermal-state sample, on a stable scale defined in the C header.
+#[unsafe(no_mangle)]
+pub extern "C" fn horizon_ios_set_thermal_state(state: c_int) {
+    horizon_client::platform::set_apple_thermal_status(state);
+}
+
+/// OS Low Power Mode is independent of the player's saved Battery Mode.
+#[unsafe(no_mangle)]
+pub extern "C" fn horizon_ios_set_low_power_mode(enabled: c_int) {
+    horizon_client::platform::set_low_power_mode(enabled != 0);
+}
+
 /// The app's Documents folder, from `main.swift`, as a C string.
 #[unsafe(no_mangle)]
 pub extern "C" fn horizon_ios_main(documents: *const c_char) -> c_int {
+    let origin = Instant::now();
+    horizon_client::telemetry::mark_start();
     static STARTED: AtomicBool = AtomicBool::new(false);
     // The Swift launcher starts the game at most once per process: a second run
     // would find the game's process-wide state in use.
@@ -76,7 +91,8 @@ pub extern "C" fn horizon_ios_main(documents: *const c_char) -> c_int {
     };
     // Panics are caught here so that the launcher can show what happened instead
     // of the process aborting.
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(&documents)));
+    let outcome =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| start(&documents, origin)));
     let (code, failure) = match outcome {
         Ok(Ok(code)) => (code, None),
         Ok(Err(Failure::Error(message))) => (EXIT_ERROR, Some(message)),
@@ -135,7 +151,7 @@ fn prepared_dir(documents: &Path) -> PathBuf {
         .join(PREPARED_VERSION)
 }
 
-fn start(documents: &Path) -> Result<c_int, Failure> {
+fn start(documents: &Path, origin: Instant) -> Result<c_int, Failure> {
     // First, as in `entry::main`: the allocator's purge delay, before any thread
     // exists. (The `system-allocator` feature is the escape hatch if mimalloc
     // ever fails to build for iOS; ios/README.md.)
@@ -145,6 +161,10 @@ fn start(documents: &Path) -> Result<c_int, Failure> {
     let container = documents.parent().unwrap_or(documents);
     let tmp = documents.join("tmp");
     let _ = fs::create_dir_all(&tmp);
+    // Relative trace paths such as logs/startup.jsonl must work on the first
+    // launch, before logging::init creates its own files.
+    fs::create_dir_all(documents.join("logs"))
+        .map_err(|e| Failure::Error(format!("Could not create the logs folder: {e}")))?;
     // The game takes its folder from the working directory and `HORIZON_HOME`,
     // and a phone's defaults for both are not writable.
     // SAFETY: the game's own threads do not exist yet, and nothing else running
@@ -159,6 +179,10 @@ fn start(documents: &Path) -> Result<c_int, Failure> {
     std::env::set_current_dir(documents)
         .map_err(|e| Failure::Error(format!("Could not enter {}: {e}", documents.display())))?;
     let from_file = env_file(documents);
+    // Read horizon-env.txt after choosing writable folders, before opening an
+    // optional startup trace. The origin still includes the shell setup.
+    horizon_client::spans::startup::init(origin);
+    let _entry = horizon_client::spans::startup::step("ios.entry");
     fs::write(documents.join(RUNNING_FILE), "running\n").ok();
     let _ = fs::remove_file(documents.join(ERROR_FILE));
     logging::set_game_home(documents.to_path_buf());
@@ -169,6 +193,11 @@ fn start(documents: &Path) -> Result<c_int, Failure> {
         documents.display()
     );
     crash::install(documents.to_path_buf(), "client");
+    match horizon_client::mobile::seed(documents) {
+        Ok(files) if !files.is_empty() => log::info!("Horizon: seeded mobile defaults: {files:?}"),
+        Ok(_) => {}
+        Err(error) => log::warn!("Horizon: could not seed mobile defaults: {error}"),
+    }
     if !from_file.is_empty() {
         log::info!("Horizon: environment from {ENV_FILE}: {from_file:?}");
     }
