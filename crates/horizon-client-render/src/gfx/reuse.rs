@@ -17,20 +17,20 @@ use std::{
 };
 
 /// One map of kept objects with the generation each was last asked for in.
-struct Kept<T> {
-    map: Mutex<HashMap<String, (T, u32)>>,
+struct Kept<T, K = String> {
+    map: Mutex<HashMap<K, (T, u32)>>,
 }
-impl<T> Default for Kept<T> {
+impl<T, K> Default for Kept<T, K> {
     fn default() -> Self {
         Self {
             map: Mutex::new(HashMap::new()),
         }
     }
 }
-impl<T: Clone> Kept<T> {
+impl<T: Clone, K: Eq + std::hash::Hash> Kept<T, K> {
     /// The object kept under `key`, else `make`'s, kept. The lock is not
     /// held while `make` compiles.
-    fn get(&self, key: String, generation: u32, make: impl FnOnce() -> T) -> T {
+    fn get(&self, key: K, generation: u32, make: impl FnOnce() -> T) -> T {
         if let Some((object, used)) = self
             .map
             .lock()
@@ -65,11 +65,14 @@ impl<T: Clone> Kept<T> {
 #[derive(Default)]
 pub struct Reuse {
     generation: std::sync::atomic::AtomicU32,
-    shaders: Kept<wgpu::ShaderModule>,
-    bind_group_layouts: Kept<wgpu::BindGroupLayout>,
-    pipeline_layouts: Kept<wgpu::PipelineLayout>,
-    render: Kept<wgpu::RenderPipeline>,
+    shaders: Kept<wgpu::ShaderModule, DescriptorKey>,
+    bind_group_layouts: Kept<wgpu::BindGroupLayout, DescriptorKey>,
+    pipeline_layouts: Kept<wgpu::PipelineLayout, DescriptorKey>,
+    render: Kept<wgpu::RenderPipeline, DescriptorKey>,
 }
+/// Device identity is part of every key, even for descriptors such as a
+/// shader source or bind-group layout that contain no GPU handles themselves.
+type DescriptorKey = (wgpu::Device, String);
 
 impl Reuse {
     /// A renderer starts building: what it asks for is kept, the rest is let
@@ -119,7 +122,7 @@ impl On<'_> {
         &self,
         descriptor: wgpu::ShaderModuleDescriptor<'_>,
     ) -> wgpu::ShaderModule {
-        let key = format!("{descriptor:?}");
+        let key = (self.device.clone(), format!("{descriptor:?}"));
         self.reuse.shaders.get(key, self.generation, || {
             self.device.create_shader_module(descriptor)
         })
@@ -128,7 +131,7 @@ impl On<'_> {
         &self,
         descriptor: &wgpu::BindGroupLayoutDescriptor<'_>,
     ) -> wgpu::BindGroupLayout {
-        let key = format!("{descriptor:?}");
+        let key = (self.device.clone(), format!("{descriptor:?}"));
         self.reuse.bind_group_layouts.get(key, self.generation, || {
             self.device.create_bind_group_layout(descriptor)
         })
@@ -137,7 +140,7 @@ impl On<'_> {
         &self,
         descriptor: &wgpu::PipelineLayoutDescriptor<'_>,
     ) -> wgpu::PipelineLayout {
-        let key = format!("{descriptor:?}");
+        let key = (self.device.clone(), format!("{descriptor:?}"));
         self.reuse.pipeline_layouts.get(key, self.generation, || {
             self.device.create_pipeline_layout(descriptor)
         })
@@ -146,7 +149,7 @@ impl On<'_> {
         &self,
         descriptor: &wgpu::RenderPipelineDescriptor<'_>,
     ) -> wgpu::RenderPipeline {
-        let key = format!("{descriptor:?}");
+        let key = (self.device.clone(), format!("{descriptor:?}"));
         self.reuse.render.get(key, self.generation, || {
             self.device.create_render_pipeline(descriptor)
         })
@@ -155,7 +158,204 @@ impl On<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::Kept;
+    use super::*;
+
+    struct Program {
+        shader: wgpu::ShaderModule,
+        bindings: wgpu::BindGroupLayout,
+        layout: wgpu::PipelineLayout,
+        pipeline: wgpu::RenderPipeline,
+    }
+    const SHADER: &str = "@group(0) @binding(0) var<uniform> tint: vec4<f32>;
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+            return vec4<f32>(f32(i & 1u) * 4.0 - 1.0, f32(i >> 1u) * 4.0 - 1.0, 0.0, 1.0);
+        }
+        @fragment fn fs() -> @location(0) vec4<f32> { return tint; }";
+    fn program(on: &On<'_>, format: wgpu::TextureFormat) -> Program {
+        let shader = on.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("reuse test"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let bindings = on.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("reuse test"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let layout = on.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("reuse test"),
+            bind_group_layouts: &[Some(&bindings)],
+            ..Default::default()
+        });
+        let pipeline = on.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("reuse test"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(format.into())],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        Program {
+            shader,
+            bindings,
+            layout,
+            pipeline,
+        }
+    }
+    fn pixel(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        program: &Program,
+        tint: [f32; 4],
+    ) -> [u8; 4] {
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("distinct mutable tint"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&tint));
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &program.bindings,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let read = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&program.pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &read,
+                layout: Default::default(),
+            },
+            target.size(),
+        );
+        queue.submit([encoder.finish()]);
+        read.slice(..)
+            .map_async(wgpu::MapMode::Read, |r| r.unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let color: [u8; 4] = read.slice(..).get_mapped_range().unwrap()[..4]
+            .try_into()
+            .unwrap();
+        read.unmap();
+        color
+    }
+
+    #[test]
+    fn device_and_descriptor_boundaries_keep_pixels_and_mutable_uniforms_distinct() {
+        let instance = crate::gfx::test_gpu::instance();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("Skipping pipeline reuse test: no GPU adapter");
+            return;
+        };
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let reuse = Reuse::default();
+        let generation = reuse.begin();
+        let first = program(&reuse.on(&device), wgpu::TextureFormat::Rgba8Unorm);
+        reuse.finish(generation);
+        let generation = reuse.begin();
+        let second = program(&reuse.on(&device), wgpu::TextureFormat::Rgba8Unorm);
+        assert_eq!(first.shader, second.shader);
+        assert_eq!(first.bindings, second.bindings);
+        assert_eq!(first.layout, second.layout);
+        assert_eq!(first.pipeline, second.pipeline);
+        assert_eq!(
+            pixel(&device, &queue, &first, [1.0, 0.0, 0.0, 1.0]),
+            [255, 0, 0, 255]
+        );
+        assert_eq!(
+            pixel(&device, &queue, &second, [0.0, 1.0, 0.0, 1.0]),
+            [0, 255, 0, 255]
+        );
+        assert_eq!(
+            pixel(&device, &queue, &first, [1.0, 0.0, 0.0, 1.0]),
+            [255, 0, 0, 255]
+        );
+        let changed = program(&reuse.on(&device), wgpu::TextureFormat::Bgra8Unorm);
+        assert_ne!(changed.pipeline, first.pipeline);
+        let changed_source = reuse
+            .on(&device)
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("reuse test"),
+                source: wgpu::ShaderSource::Wgsl(
+                    SHADER.replace("return tint;", "return tint * 0.5;").into(),
+                ),
+            });
+        assert_ne!(changed_source, first.shader);
+        let (other, other_queue) =
+            pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let other_program = program(&reuse.on(&other), wgpu::TextureFormat::Rgba8Unorm);
+        assert_ne!(other_program.shader, first.shader);
+        assert_ne!(other_program.bindings, first.bindings);
+        assert_ne!(other_program.layout, first.layout);
+        assert_ne!(other_program.pipeline, first.pipeline);
+        assert_eq!(
+            pixel(&other, &other_queue, &other_program, [0.0, 0.0, 1.0, 1.0]),
+            [0, 0, 255, 255]
+        );
+        reuse.finish(generation);
+    }
 
     /// A key asked for again gets the kept object without making one; what
     /// the latest generation did not ask for is let go when it finishes.
