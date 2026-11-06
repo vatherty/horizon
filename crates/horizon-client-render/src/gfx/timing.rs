@@ -16,6 +16,47 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 
+/// Diagnostic counters, not frame-time samples. Requested frames may be
+/// skipped while all asynchronous readback slots are occupied.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTimingStats {
+    pub requested: u64,
+    pub submitted: u64,
+    pub completed: u64,
+    pub invalid: u64,
+    pub busy: u64,
+}
+
+/// No timing work by default. F3/pass diagnostics demand full timing;
+/// HORIZON_GPU_TIMING=sampled requests one frame in 120, =full (or 1) every frame.
+pub(super) struct Sampling {
+    interval: Option<u64>,
+    frame: u64,
+    pub demand: bool,
+}
+impl Sampling {
+    pub fn from_environment() -> Self {
+        Self::from_value(std::env::var("HORIZON_GPU_TIMING").ok().as_deref())
+    }
+    fn from_value(value: Option<&str>) -> Self {
+        Self {
+            interval: match value {
+                Some("sampled") => Some(120),
+                Some("1" | "full") => Some(1),
+                _ => None,
+            },
+            frame: 0,
+            demand: false,
+        }
+    }
+    pub fn next(&mut self, feedback: bool) -> bool {
+        let interval = self.interval.or(feedback.then_some(120));
+        let sample = self.demand || interval.is_some_and(|n| self.frame.is_multiple_of(n));
+        self.frame = self.frame.wrapping_add(1);
+        sample
+    }
+}
+
 /// Frames in flight at once; on Metal a slot is busy for about five frames.
 const SLOTS: usize = 8;
 /// Each slot's timestamps have their own queries and resolve range.
@@ -36,6 +77,8 @@ const FAILED: u8 = 5;
 struct Slot {
     buffer: wgpu::Buffer,
     state: Arc<AtomicU8>,
+    /// Only real world frames may drive optional resolution feedback.
+    feedback: bool,
 }
 
 pub struct GpuTimer {
@@ -50,6 +93,9 @@ pub struct GpuTimer {
     markers: Option<Markers>,
     /// Slots resolved in this frame's commands, read back once it is submitted.
     resolved: Vec<usize>,
+    /// Submission order, independent of callback and slot completion order.
+    order: std::collections::VecDeque<usize>,
+    pub stats: GpuTimingStats,
 }
 
 /// The marker passes: the start's compute pipeline, and the end's shader and
@@ -99,6 +145,7 @@ impl GpuTimer {
                     mapped_at_creation: false,
                 }),
                 state: Arc::new(AtomicU8::new(FREE)),
+                feedback: false,
             })
             .collect();
         Some(Self {
@@ -130,9 +177,12 @@ impl GpuTimer {
                 }
             }),
             resolved: Vec::new(),
+            order: Default::default(),
+            stats: Default::default(),
         })
     }
-    pub fn begin(&mut self, encoder: &mut wgpu::CommandEncoder) {
+    pub fn begin(&mut self, encoder: &mut wgpu::CommandEncoder, sample: bool, feedback: bool) {
+        self.current = None;
         if self
             .slots
             .iter()
@@ -148,9 +198,18 @@ impl GpuTimer {
                 }
             }
         }
-        let slot = self.next;
-        self.current = (self.slots[slot].state.load(Ordering::Acquire) == FREE).then_some(slot);
-        let Some(slot) = self.current else { return };
+        if !sample {
+            return;
+        }
+        self.stats.requested += 1;
+        self.current = (0..SLOTS)
+            .map(|i| (self.next + i) % SLOTS)
+            .find(|&i| self.slots[i].state.load(Ordering::Acquire) == FREE);
+        let Some(slot) = self.current else {
+            self.stats.busy += 1;
+            return;
+        };
+        self.slots[slot].feedback = feedback;
         let index = 2 * slot as u32;
         let Some(markers) = &self.markers else {
             encoder.write_timestamp(&self.queries, index);
@@ -234,6 +293,8 @@ impl GpuTimer {
         let Some(slot) = self.current.take() else {
             return;
         };
+        self.order.push_back(slot);
+        self.stats.submitted += 1;
         if self.markers.is_some() {
             let state = self.slots[slot].state.clone();
             state.store(RUNNING, Ordering::Release);
@@ -242,27 +303,48 @@ impl GpuTimer {
         self.next = (slot + 1) % SLOTS;
     }
     /// GPU milliseconds of frames whose timestamps have arrived, oldest first.
-    pub fn collect(&mut self, device: &wgpu::Device, out: &mut Vec<f32>) {
+    pub fn collect(
+        &mut self,
+        device: &wgpu::Device,
+        out: &mut Vec<f32>,
+        mut observed: impl FnMut(f32, bool),
+    ) {
+        if self.order.is_empty() {
+            return;
+        }
         if device.poll(wgpu::PollType::Poll).is_err() {
             return;
         }
-        for i in 0..SLOTS {
-            let slot = &self.slots[(self.next + i) % SLOTS];
-            if slot.state.load(Ordering::Acquire) != MAPPED {
-                continue;
+        while let Some(&index) = self.order.front() {
+            let slot = &self.slots[index];
+            match slot.state.load(Ordering::Acquire) {
+                FAILED => {
+                    self.order.pop_front();
+                    self.stats.invalid += 1;
+                    continue;
+                }
+                MAPPED => {}
+                _ => break,
             }
+            self.order.pop_front();
             {
                 let Ok(data) = slot.buffer.slice(..).get_mapped_range() else {
                     // Device loss can destroy a buffer after its mapping succeeded.
                     // Unmapping it would turn the failed readback into a panic.
                     slot.state.store(FAILED, Ordering::Release);
+                    self.stats.invalid += 1;
                     continue;
                 };
                 // Read unaligned: the mapping isn't guaranteed to be 8-byte aligned.
                 let stamps: [u64; 2] = bytemuck::pod_read_unaligned(&data[..16]);
                 // A start marker that ran late (rare on Metal) leaves the frame untimed.
-                if let Some(ticks) = stamps[1].checked_sub(stamps[0]) {
-                    out.push((ticks as f64 * f64::from(self.period_ns) / 1e6) as f32);
+                if let Some(ticks) = stamps[1].checked_sub(stamps[0]).filter(|&t| t > 0) {
+                    let ms = (ticks as f64 * f64::from(self.period_ns) / 1e6) as f32;
+                    out.push(ms);
+                    observed(ms, slot.feedback);
+                    self.stats.completed += 1;
+                } else {
+                    self.stats.invalid += 1;
                 }
             }
             slot.buffer.unmap();
@@ -308,6 +390,23 @@ pub(super) fn end_pipeline(
 mod tests {
     use super::*;
 
+    #[test]
+    fn timing_is_opt_in_sampled_or_explicitly_demanded() {
+        let mut disabled = Sampling::from_value(None);
+        assert!((0..240).all(|_| !disabled.next(false)));
+        disabled.demand = true;
+        assert!((0..240).all(|_| disabled.next(false)));
+        disabled.demand = false;
+        assert!(!disabled.next(false));
+        let mut sampled = Sampling::from_value(Some("sampled"));
+        let frames: Vec<_> = (0..241).filter(|_| sampled.next(false)).collect();
+        assert_eq!(frames, [0, 120, 240]);
+        let mut feedback = Sampling::from_value(None);
+        assert!(feedback.next(true));
+        assert!((0..119).all(|_| !feedback.next(true)));
+        assert!(feedback.next(true));
+    }
+
     fn mapped_timer() -> Option<(wgpu::Device, wgpu::Queue, GpuTimer)> {
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         // WGL can hang while creating a test instance on Windows (#5238).
@@ -330,6 +429,7 @@ mod tests {
         );
         queue.submit([]);
         timer.resolved.push(0);
+        timer.order.push_back(0);
         timer.submitted(&queue);
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         assert_eq!(timer.slots[0].state.load(Ordering::Acquire), MAPPED);
@@ -343,12 +443,49 @@ mod tests {
             return;
         };
         let mut samples = Vec::new();
-        timer.collect(&device, &mut samples);
+        timer.collect(&device, &mut samples, |_, _| {});
         assert_eq!(
             samples,
             vec![(10.0 * f64::from(timer.period_ns) / 1e6) as f32]
         );
         assert_eq!(timer.slots[0].state.load(Ordering::Acquire), FREE);
+    }
+
+    #[test]
+    fn completed_samples_keep_submission_order_and_counts() {
+        let Some((device, queue, mut timer)) = mapped_timer() else {
+            eprintln!("Skipping GPU timer test: no timestamp-capable adapter");
+            return;
+        };
+        // The later callback arrives first. Its buffer must remain mapped
+        // until the older sample can be emitted ahead of it.
+        timer.slots[0].state.store(PENDING, Ordering::Release);
+        timer.slots[1].feedback = true;
+        queue.write_buffer(
+            &timer.slots[1].buffer,
+            0,
+            bytemuck::cast_slice(&[30_u64, 60]),
+        );
+        queue.submit([]);
+        timer.resolved.push(1);
+        timer.order.push_back(1);
+        timer.submitted(&queue);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let mut samples = Vec::new();
+        timer.collect(&device, &mut samples, |_, _| {});
+        assert!(samples.is_empty());
+        assert_eq!(timer.stats.completed, 0);
+        timer.slots[0].state.store(MAPPED, Ordering::Release);
+        let mut feedback = Vec::new();
+        timer.collect(&device, &mut samples, |ms, world| {
+            feedback.push((ms, world))
+        });
+        let ms = |ticks: f64| (ticks * f64::from(timer.period_ns) / 1e6) as f32;
+        assert_eq!(samples, [ms(10.0), ms(30.0)]);
+        assert_eq!(feedback, [(ms(10.0), false), (ms(30.0), true)]);
+        assert_eq!(timer.stats.completed, 2);
+        assert_eq!(timer.stats.invalid, 0);
+        assert!(timer.order.is_empty());
     }
 
     #[test]
@@ -360,17 +497,17 @@ mod tests {
         // Reproduce a buffer destroyed after its successful map callback (#6320).
         timer.slots[0].buffer.destroy();
         let mut samples = Vec::new();
-        timer.collect(&device, &mut samples);
+        timer.collect(&device, &mut samples, |_, _| {});
         assert!(samples.is_empty());
         assert_eq!(timer.slots[0].state.load(Ordering::Acquire), FAILED);
         // Later frames must not resolve or copy into the failed readback buffer.
         let mut encoder = device.create_command_encoder(&Default::default());
-        timer.begin(&mut encoder);
+        timer.begin(&mut encoder, true, true);
         assert!(timer.current.is_none());
         assert!(timer.resolved.is_empty());
         queue.submit([encoder.finish()]);
         timer.submitted(&queue);
-        timer.collect(&device, &mut samples);
+        timer.collect(&device, &mut samples, |_, _| {});
         assert!(samples.is_empty());
     }
 }
