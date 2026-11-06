@@ -769,7 +769,7 @@ impl Game<'_> {
     /// A saved painting, or its compound when its variant is unknown.
     pub(super) fn load_painting(&mut self, tag: Tag, uuid: Option<[i32; 4]>, key: ChunkKey) {
         if let Some((pos, facing, variant)) = entity_nbt::painting_from_nbt(&tag)
-            && let Some(v) = self.painting_variants.get(&variant).cloned()
+            && let Some(v) = self.model_assets.painting_variants.get(&variant).cloned()
         {
             self.next_entity += 1;
             let id = self.next_entity;
