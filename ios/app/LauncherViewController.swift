@@ -12,11 +12,21 @@
 // player relaunches the app (closes it and opens it again) instead of tapping
 // Start, because winit cannot start its event loop in a process where
 // `UIApplicationMain` has already run — see main.swift and ios/README.md.
+//
+// A separate log screen (LogViewController) shows the end of the log wrapped
+// to the screen's width: the game's own startup log screen does not wrap, so
+// its lines run off the phone's edge and the ends of them cannot be read.
 
 import UIKit
 import UniformTypeIdentifiers
 
 final class LauncherViewController: UIViewController, UIDocumentPickerDelegate {
+    /// `horizon_ios_resources_state` codes (Horizon-Bridging-Header.h): 0 the
+    /// resources are missing, 1 they are in resources/. These two name where
+    /// else the game accepts them from.
+    private let resourcesInPrepared: Int32 = 2
+    private let resourcesFromArgs: Int32 = 3
+
     private let importer = ResourceImporter()
 
     private let scrollView = UIScrollView()
@@ -32,6 +42,7 @@ final class LauncherViewController: UIViewController, UIDocumentPickerDelegate {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        title = Strings.appTitle
         view.backgroundColor = UIColor(red: 18 / 255, green: 18 / 255, blue: 22 / 255, alpha: 1)
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(scrollView)
@@ -93,7 +104,13 @@ final class LauncherViewController: UIViewController, UIDocumentPickerDelegate {
         let errorURL = folder.appendingPathComponent("last-error.txt")
         let markerURL = folder.appendingPathComponent("running.marker")
         let manifestURL = folder.appendingPathComponent("resources/horizon-resources.json")
-        let ready = FileManager.default.fileExists(atPath: manifestURL.path)
+        // The game's own verdict on where the resources are (the Rust shell's
+        // `resources_state`, over the bridge): this screen's old check knew
+        // only resources/, so it called the resources missing on phones where
+        // the game would have found them in the prepared folder or at a
+        // horizon-args.txt override.
+        let resourcesState = folder.path.withCString { horizon_ios_resources_state($0) }
+        let ready = resourcesState != 0
         let white = UIColor.white
         let grey = UIColor(red: 170 / 255, green: 170 / 255, blue: 180 / 255, alpha: 1)
         let red = UIColor(red: 1, green: 140 / 255, blue: 120 / 255, alpha: 1)
@@ -127,6 +144,10 @@ final class LauncherViewController: UIViewController, UIDocumentPickerDelegate {
         if !ready {
             column.addArrangedSubview(makeText(Strings.resourcesMissingBody, size: 15, color: white))
             column.addArrangedSubview(makeText(Strings.importDestination(manifestURL.deletingLastPathComponent().path), size: 13, color: grey))
+        } else if resourcesState == resourcesInPrepared {
+            column.addArrangedSubview(makeText(Strings.resourcesFoundPrepared, size: 13, color: grey))
+        } else if resourcesState == resourcesFromArgs {
+            column.addArrangedSubview(makeText(Strings.resourcesFoundArgs, size: 13, color: grey))
         } else {
             column.addArrangedSubview(makeText(
                 Strings.resourcesFound(manifestURL.deletingLastPathComponent().path), size: 13, color: grey
@@ -136,6 +157,7 @@ final class LauncherViewController: UIViewController, UIDocumentPickerDelegate {
         column.addArrangedSubview(makeButton(ready ? Strings.importFolderReplace : Strings.importFolderReady, action: #selector(pickFolder)))
         column.addArrangedSubview(makeButton(ready ? Strings.importZipReplace : Strings.importZipReady, action: #selector(pickZip)))
         column.addArrangedSubview(makeButton(ready ? Strings.startGame : Strings.startAnyway, action: #selector(startGameTapped)))
+        column.addArrangedSubview(makeButton(Strings.viewLog, action: #selector(viewLogTapped)))
         column.addArrangedSubview(makeButton(Strings.shareLog, action: #selector(shareLogTapped)))
         if FileManager.default.fileExists(atPath: errorURL.path)
             || FileManager.default.fileExists(atPath: markerURL.path) {
@@ -165,8 +187,19 @@ final class LauncherViewController: UIViewController, UIDocumentPickerDelegate {
         // this process (which already called `UIApplicationMain`) is gone. The
         // player closes the app and opens it again; on that launch the resources
         // are there and `main.swift` hands the process to the game.
-        importResult = Strings.importedBody
+        importResult = Strings.startHint
         show()
+    }
+
+    @objc private func viewLogTapped() {
+        let log = LogViewController()
+        if let navigation = navigationController {
+            navigation.pushViewController(log, animated: true)
+        } else {
+            // No stack to push onto (the delegate roots the launcher in one,
+            // so this is a fallback): present the log screen with its own.
+            present(UINavigationController(rootViewController: log), animated: true)
+        }
     }
 
     @objc private func shareLogTapped() {
