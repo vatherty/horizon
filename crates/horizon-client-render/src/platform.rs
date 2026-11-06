@@ -61,13 +61,29 @@ pub mod thermal {
 
 static THERMAL_STATUS: AtomicI32 = AtomicI32::new(thermal::NONE);
 
-/// The device's thermal status as the Java side last reported it.
+/// The device's thermal status as the platform last reported it.
 pub fn set_thermal_status(status: i32) {
     THERMAL_STATUS.store(status, Ordering::Relaxed);
 }
 
 pub fn thermal_status() -> i32 {
     THERMAL_STATUS.load(Ordering::Relaxed)
+}
+
+/// The stable scalar bridge from Apple's `ProcessInfo.ThermalState`: 0 nominal,
+/// 1 fair, 2 serious, 3 critical. These are deliberately translated rather than
+/// passed to the Android status scale, where 1 and 2 have different meanings.
+pub fn set_apple_thermal_status(state: i32) {
+    set_thermal_status(apple_thermal_status(state));
+}
+
+fn apple_thermal_status(state: i32) -> i32 {
+    match state {
+        0 => thermal::NONE,
+        1 => thermal::MODERATE,
+        2 => thermal::SEVERE,
+        _ => thermal::CRITICAL,
+    }
 }
 
 /// The most frames per second the game should draw at a thermal status:
@@ -81,6 +97,58 @@ pub fn thermal_fps_cap(status: i32) -> Option<u32> {
         thermal::SEVERE => Some(30),
         _ => Some(20),
     }
+}
+
+// OS power policy is independent of the player's Battery Mode setting. Clearing
+// it restores the current player/thermal cap without ever changing options files.
+static LOW_POWER_MODE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_low_power_mode(enabled: bool) {
+    LOW_POWER_MODE.store(enabled, Ordering::Relaxed);
+}
+
+pub fn low_power_mode() -> bool {
+    LOW_POWER_MODE.load(Ordering::Relaxed)
+}
+
+/// The common rendering cap for gameplay and loading. `in_world` means active
+/// gameplay, not a menu drawn over a world. The caller first applies its vanilla
+/// inactivity limit; every power policy may only lower that result.
+pub fn effective_fps_cap(
+    player_limit: u32,
+    battery_mode: bool,
+    in_world: bool,
+    focused: bool,
+) -> u32 {
+    intersect_fps_caps(
+        player_limit,
+        battery_mode,
+        in_world,
+        focused,
+        thermal_status(),
+        low_power_mode(),
+    )
+}
+
+fn intersect_fps_caps(
+    player_limit: u32,
+    battery_mode: bool,
+    in_world: bool,
+    focused: bool,
+    thermal: i32,
+    os_low_power: bool,
+) -> u32 {
+    let mut cap = player_limit.max(1);
+    if battery_mode {
+        cap = cap.min(if in_world && focused { 60 } else { 30 });
+    }
+    if let Some(thermal) = thermal_fps_cap(thermal) {
+        cap = cap.min(thermal);
+    }
+    if os_low_power {
+        cap = cap.min(30);
+    }
+    cap
 }
 
 // ---- pointer events ------------------------------------------------------------------------
@@ -215,6 +283,32 @@ mod tests {
         assert_eq!(thermal_fps_cap(thermal::CRITICAL), Some(20));
         assert_eq!(thermal_fps_cap(thermal::SHUTDOWN), Some(20));
         assert_eq!(thermal_fps_cap(-1), None);
+    }
+
+    #[test]
+    fn apple_states_enter_the_cap_at_their_own_severity() {
+        assert_eq!(thermal_fps_cap(apple_thermal_status(0)), None);
+        assert_eq!(thermal_fps_cap(apple_thermal_status(1)), Some(45));
+        assert_eq!(thermal_fps_cap(apple_thermal_status(2)), Some(30));
+        assert_eq!(thermal_fps_cap(apple_thermal_status(3)), Some(20));
+        assert_eq!(thermal_fps_cap(apple_thermal_status(99)), Some(20));
+    }
+
+    #[test]
+    fn independent_caps_intersect_and_recover_to_the_players_current_choice() {
+        let cap = intersect_fps_caps;
+        assert_eq!(cap(120, true, true, true, thermal::NONE, false), 60);
+        assert_eq!(cap(120, true, false, true, thermal::NONE, false), 30);
+        assert_eq!(cap(120, true, true, false, thermal::NONE, false), 30);
+        assert_eq!(cap(25, true, true, true, thermal::MODERATE, true), 25);
+        assert_eq!(cap(120, false, true, true, thermal::MODERATE, false), 45);
+        assert_eq!(cap(120, false, true, true, thermal::MODERATE, true), 30);
+        assert_eq!(cap(120, true, true, true, thermal::CRITICAL, true), 20);
+        // Power clears while still hot, then thermal recovers. A new player
+        // choice made while hot is retained throughout both transitions.
+        assert_eq!(cap(50, true, true, true, thermal::CRITICAL, false), 20);
+        assert_eq!(cap(50, true, true, true, thermal::NONE, false), 50);
+        assert_eq!(cap(120, false, true, true, thermal::NONE, false), 120);
     }
 
     #[test]
