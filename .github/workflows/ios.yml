@@ -29,7 +29,7 @@ jobs:
           python3 tools/check_public_tree.py --history
 
   ipa:
-    runs-on: macos-15
+    runs-on: macos-14
     timeout-minutes: 90
     permissions:
       # Only to keep the "ios-latest" pre-release below current; nothing else writes.
