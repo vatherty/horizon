@@ -698,12 +698,13 @@ pub struct Graphics {
     pub cache_banners: bool,
     /// Cache copper-golem statue models.
     pub cache_copper_golem_statues: bool,
-    /// Meshed sections uploaded per frame; 0 uploads all that are ready.
+    /// Meshed sections uploaded per frame; 0 uses the automatic elapsed-time slice.
     pub chunk_updates: u32,
     /// Section mesh bytes uploaded per frame, in KiB; 0 is unlimited.
     pub upload_budget_kib: u32,
-    /// The block textures' video memory (their top mip level), in MiB; 0 leaves it to
-    /// Horizon (`sprites::DEFAULT_TEXTURE_BUDGET`). Applies when resources next load.
+    /// Budget for block textures' top-mip color data in MiB; not total texture,
+    /// Metal or process memory. 0 leaves it to Horizon
+    /// (`sprites::DEFAULT_TEXTURE_BUDGET`). Applies when resources next load.
     pub texture_budget_mib: u32,
     pub sky: bool,
     pub fog: bool,
