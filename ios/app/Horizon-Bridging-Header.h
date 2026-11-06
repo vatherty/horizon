@@ -19,6 +19,13 @@
 /// not on the phone yet.
 int horizon_ios_main(const char *documents);
 
+/// Where the prepared resources are, by the game's own rules (an
+/// horizon-args.txt `--resources` override, the import in resources/, or the
+/// prepared folder): 0 missing, 1 in resources/, 2 in the prepared folder,
+/// 3 at the args override. Pure path checks — no game state is touched, so
+/// the launcher may call it on any launch, as often as it likes.
+int32_t horizon_ios_resources_state(const char *documents);
+
 /// ProcessInfo thermal severity: 0 nominal, 1 fair, 2 serious, 3 critical.
 /// These setters only update atomics; notification delivery never waits for
 /// rendering, world ticks or disk I/O.
