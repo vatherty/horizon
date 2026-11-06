@@ -74,6 +74,31 @@ pub extern "C" fn horizon_ios_set_low_power_mode(enabled: c_int) {
     horizon_client::platform::set_low_power_mode(enabled != 0);
 }
 
+/// The prepared resources are not on the phone.
+pub const RESOURCES_MISSING: c_int = 0;
+/// The prepared resources are imported, in `resources/`.
+pub const RESOURCES_IN_RESOURCES: c_int = 1;
+/// The prepared resources are in the prepared folder (`.local/horizon-client/26.3`).
+pub const RESOURCES_IN_PREPARED: c_int = 2;
+/// The prepared resources are where `horizon-args.txt`'s `--resources` points.
+pub const RESOURCES_FROM_ARGS: c_int = 3;
+
+/// Where the prepared resources are, by the game's own rules — the answer
+/// [`check_resources`] reaches inside a run, as one of the `RESOURCES_*`
+/// codes. The Swift launcher asks with this instead of repeating the path
+/// rules in Swift: its own check once knew only `resources/`, so it called
+/// the resources missing on phones where the game would have found them in
+/// the prepared folder or at an args override. Pure path checks (plus
+/// reading `horizon-args.txt`): no folders are created and no game state is
+/// touched, so the launcher may call it on any launch, as often as it likes.
+#[unsafe(no_mangle)]
+pub extern "C" fn horizon_ios_resources_state(documents: *const c_char) -> c_int {
+    let Some(documents) = cstr_to_path(documents) else {
+        return RESOURCES_MISSING;
+    };
+    resources_state(&documents)
+}
+
 /// The app's Documents folder, from `main.swift`, as a C string.
 #[unsafe(no_mangle)]
 pub extern "C" fn horizon_ios_main(documents: *const c_char) -> c_int {
@@ -295,20 +320,30 @@ fn ensure_prepared_symlink(documents: &Path) {
     }
 }
 
+/// Where the prepared resources are: one of the `RESOURCES_*` codes. The
+/// order is [`check_resources`]'s: an args override the player asked for
+/// wins, then the import in `resources/`, then a prepared folder of their own.
+fn resources_state(documents: &Path) -> c_int {
+    if let Some(dir) = args_resources(documents)
+        && dir.join(MANIFEST).is_file()
+    {
+        return RESOURCES_FROM_ARGS;
+    }
+    if resources_dir(documents).join(MANIFEST).is_file() {
+        return RESOURCES_IN_RESOURCES;
+    }
+    if prepared_dir(documents).join(MANIFEST).is_file() {
+        return RESOURCES_IN_PREPARED;
+    }
+    RESOURCES_MISSING
+}
+
 /// Stops with a readable message when the prepared resources are not on the
 /// phone, which is the first thing that goes wrong. The Swift launcher shows
 /// this message and offers the import; the code it gets back is
 /// [`EXIT_NO_RESOURCES`].
 fn check_resources(documents: &Path) -> Result<(), String> {
-    if let Some(dir) = args_resources(documents)
-        && dir.join(MANIFEST).is_file()
-    {
-        return Ok(());
-    }
-    if resources_dir(documents).join(MANIFEST).is_file() {
-        return Ok(());
-    }
-    if prepared_dir(documents).join(MANIFEST).is_file() {
+    if resources_state(documents) != RESOURCES_MISSING {
         return Ok(());
     }
     Err(format!(
