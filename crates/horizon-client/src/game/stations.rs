@@ -2197,7 +2197,7 @@ impl Game<'_> {
         // author and size, or in a creative tab "Random variant".
         if &*stack.item == "minecraft:painting" && display.shows("minecraft:painting/variant") {
             use horizon_client::text::Text;
-            if let Some(v) = self.painting_variants.of_stack(stack) {
+            if let Some(v) = self.model_assets.painting_variants.of_stack(stack) {
                 for part in [&v.title, &v.author].into_iter().flatten() {
                     let text = horizon_client::component::to_text(part, &mut |_| Text::empty());
                     lines.push((text, u32::MAX));
