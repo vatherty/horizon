@@ -1099,7 +1099,7 @@ impl Game<'_> {
     /// beam to a crystal's target (the spikes being summoned back).
     fn end_crystal_geometry(&self, camera: glam::DVec3, out: &mut Vec<Vertex>) {
         let (Some(model), Some(r)) = (
-            self.crystal_model.as_ref(),
+            self.model_assets.crystal_model.as_ref(),
             self.gui
                 .atlas
                 .sprites
