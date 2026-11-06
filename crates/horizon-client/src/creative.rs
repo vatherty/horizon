@@ -97,6 +97,25 @@ pub struct Creative {
     /// item list changes.
     lines_cache: Mutex<Option<(String, Arc<[Vec<String>]>)>>,
 }
+impl Clone for Creative {
+    fn clone(&self) -> Self {
+        Self {
+            tabs: self.tabs.clone(),
+            selected: self.selected,
+            page: self.page,
+            scroll: self.scroll,
+            scrolling: self.scrolling,
+            search: self.search.clone(),
+            search_items: self.search_items.clone(),
+            search_index: self.search_index.clone(),
+            exported: self.exported.clone(),
+            exported_search: self.exported_search.clone(),
+            permissions: self.permissions,
+            shown: Mutex::new(None),
+            lines_cache: Mutex::new(None),
+        }
+    }
+}
 /// The grid's stacks for one tab, search text and language.
 struct Shown {
     tab: usize,
