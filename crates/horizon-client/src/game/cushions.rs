@@ -551,7 +551,7 @@ impl Game<'_> {
         camera: glam::DVec3,
         out: &mut Vec<horizon_client::mesher::Vertex>,
     ) {
-        let Some(model) = self.cushion_model.as_ref() else {
+        let Some(model) = self.model_assets.cushion_model.as_ref() else {
             return;
         };
         let sprites = &self.gui.atlas.sprites;
