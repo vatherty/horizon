@@ -12,6 +12,7 @@ use super::{
     Dim, Game, Options, PackResources, Resources, UiResources, WorldIcon,
     execution_role::ExecutionRole,
     lan::{LanSettings, Owner, SyncPreload, preload_sync_data},
+    lifecycle::LifecycleRequests,
     world_loading::{WorldLoader, WorldRequest},
 };
 use horizon_client::level_loading::{STATUS_RADIUS, Stage};
@@ -49,8 +50,8 @@ const PLAYER_CHUNKS: usize = 49;
 /// What the window tells its server thread.
 #[derive(Default)]
 struct Flags {
-    /// `Minecraft.pause`: a single-player pause screen is open.
-    paused: AtomicBool,
+    /// Menu pause and native lifecycle requests, consumed by the owner thread.
+    lifecycle: LifecycleRequests,
     stop: AtomicBool,
     failure: Mutex<Option<String>>,
     /// `IntegratedServer.getPort`: the port it is open to the LAN on, 0
@@ -147,8 +148,13 @@ impl Integrated {
     }
     /// `IntegratedServer.tickServer` skips the world while the game is paused.
     pub fn set_paused(&self, paused: bool) {
-        let split = !self.flags.split_players.lock().unwrap().is_empty();
-        self.flags.paused.store(paused && !split, Ordering::Relaxed);
+        self.flags.lifecycle.set_menu_paused(paused);
+    }
+    /// A lifecycle save/pause request, with no wait for world or disk work.
+    pub fn set_backgrounded(&self, backgrounded: bool, menu_paused: bool) {
+        self.flags
+            .lifecycle
+            .set_backgrounded(backgrounded, menu_paused);
     }
     /// Whether splitscreen players are joined: while any is, the game runs even behind a
     /// pause menu, so no window may stop ticking for one (`set_paused`, `pauses_game`).
@@ -692,13 +698,23 @@ impl Game<'_> {
                 self.wait_for_next_server_tick(&mut next, true);
                 continue;
             }
-            let paused = flags.paused.load(Ordering::Relaxed);
-            if paused && !was_paused {
+            let actions = flags.lifecycle.take(
+                was_paused,
+                flags.published.load(Ordering::Relaxed) != 0,
+                !flags.split_players.lock().unwrap().is_empty(),
+            );
+            let paused = actions.paused;
+            if actions.save {
                 // IntegratedServer.tickServer: the tick the game pauses saves
                 // everything (saveEverything, without flushing), as an
                 // autosave does.
-                log::info!("Saving and pausing game...");
+                log::info!("Saving game (paused: {paused})...");
                 self.save_game_with(false)?;
+            }
+            if actions.reset_wall_time {
+                // Resume pacing starts here; the OS's suspended wall time never
+                // becomes a burst of simulation ticks. Tick rate/state stay intact.
+                next = Instant::now();
             }
             was_paused = paused;
             if paused {
