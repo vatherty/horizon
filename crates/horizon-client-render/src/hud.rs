@@ -475,24 +475,16 @@ fn cit_sprites(
             before - ids.len()
         );
     }
-    // Decoded on the threads `pack` decodes the rest on: a big pack names thousands.
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let chunk = ids.len().div_ceil(threads).max(1);
-    std::thread::scope(|scope| {
-        let workers: Vec<_> = ids
-            .chunks(chunk)
-            .map(|ids| scope.spawn(|| ids.iter().filter_map(|id| cit_sprite(root, id)).collect()))
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|w| {
-                w.join().unwrap_or_else(|_| {
-                    log::warn!("a custom item texture decoder panicked; its textures are left out");
-                    Vec::new()
-                })
+    crate::par::par_map(&ids, |id| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cit_sprite(root, id)))
+            .unwrap_or_else(|_| {
+                log::warn!("a custom item texture decoder panicked; its texture is left out");
+                None
             })
-            .collect()
     })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 /// One of `cit_sprites`, or `None` (with a warning) when it does not load or is too big.
 fn cit_sprite(root: &Path, id: &str) -> Option<(PackedImage, Option<TextureFlags>, bool)> {
@@ -1258,20 +1250,13 @@ impl HudAtlas {
                 animated,
             ))
         };
-        let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
-        let chunk = files.len().div_ceil(threads).max(1);
-        let decoded: Vec<_> = std::thread::scope(|scope| {
-            let handles: Vec<_> = files
-                .chunks(chunk)
-                .map(|part| {
-                    scope.spawn(move || part.iter().filter_map(decode_one).collect::<Vec<_>>())
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+        let decoded: Vec<_> = crate::par::par_map(&files, |file| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_one(file)))
+                .unwrap_or_default()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         let mut flags = HashMap::new();
         let mut gui_sizes = HashMap::new();
         let mut animated: Vec<String> = Vec::new();
