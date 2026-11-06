@@ -16,7 +16,7 @@ at its sections).
 
 | Path | What |
 |---|---|
-| `ios/Cargo.toml`, `ios/src/lib.rs`, `ios/src/os_log.rs` | The `horizon-ios` crate: a `staticlib` shell (own workspace, `publish = false`). Entry point `horizon_ios_main(Documents path) -> exit code`. |
+| `ios/Cargo.toml`, `ios/src/lib.rs` | The `horizon-ios` crate: a `staticlib` shell (own workspace, `publish = false`). Entry point `horizon_ios_main(Documents path) -> exit code`. |
 | `ios/build-rust.sh` | Builds the staticlib (`cargo build --release --target aarch64-apple-ios`); seeds `ios/Cargo.lock` from the desktop lock. Run by the Xcode pre-build phase and by CI. |
 | `ios/build-ipa.sh` | One-command local build: staticlib → `xcodegen` → `xcodebuild` → unsigned `dist/horizon-ios-unsigned.ipa`. |
 | `ios/app/main.swift` | The process entry point (no `@main` AppDelegate — see below). |
@@ -209,11 +209,11 @@ before, or with, the first device run. Pointers are to `IOS_PORT_PLAN.md`.
      content path; native code mods on iOS are undecided (§8.6) and not
      promised here.
 3. **Log sink**: `IOS_PORT_PLAN.md` §5.2 assumes `platform::set_log_sink`
-   exists; upstream it does not yet. This shell's `os_log.rs` writes the
-   *shell's own* lifecycle lines to `os_log` (Console.app) via a direct
-   `os_log_create` / `os_log_with_type` FFI — the game's lines go to
-   `logs/latest.log` only. When `platform.rs` + the logging sink forwarding
-   land, the shell should pass its os_log writer to
+   exists; upstream it does not yet. There is no `os_log` sink in the shell:
+   `os_log_with_type` is not a linkable symbol on iOS (absent from `libc`
+   entirely; only `os_log_create` is exported), so the shell's lifecycle
+   lines go to `logs/latest.log` like the game's. When `platform.rs` + the
+   logging sink forwarding land, the shell should pass its writer to
    `platform::set_log_sink` instead.
 4. **`tools/check_ipa.py` + `tests/test_ipa.py`** (plan §5.6): the engine-only
    `.ipa` check currently lives inline in `ios.yml` (same forbidden list as
