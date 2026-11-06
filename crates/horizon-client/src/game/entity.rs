@@ -1241,7 +1241,7 @@ impl Entity for Boat {
         tag: Tag,
     ) -> Result<(), Tag> {
         if !(super::boats::any_boat_wood(kind)
-            .is_some_and(|(wood, chest)| game.boat_models.has(wood, chest)))
+            .is_some_and(|(wood, chest)| game.model_assets.boat_models.has(wood, chest)))
         {
             return Err(tag);
         }
