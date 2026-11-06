@@ -588,7 +588,7 @@ impl Game<'_> {
         partial: f32,
         out: &mut Vec<horizon_client::mesher::Vertex>,
     ) {
-        let Some(model) = self.entity_models.wind_charge.as_ref() else {
+        let Some(model) = self.model_assets.entity_models.wind_charge.as_ref() else {
             return;
         };
         let Some(r) = self
