@@ -7377,7 +7377,7 @@ impl Game<'_> {
                 packed = (packed & 0xFF) | (u32::from(block) * 16) << 8;
             }
             if a.is_arrow() {
-                let Some(model) = self.arrow_model.as_ref() else {
+                let Some(model) = self.model_assets.arrow_model.as_ref() else {
                     continue;
                 };
                 // SpectralArrowRenderer, and TippableArrowRenderer's `getColor() > 0`.
@@ -7434,7 +7434,7 @@ impl Game<'_> {
             }
             // ThrownTridentRenderer.
             if matches!(a.kind, ProjectileKind::Trident) {
-                let Some(model) = self.trident_model.as_ref() else {
+                let Some(model) = self.model_assets.trident_model.as_ref() else {
                     continue;
                 };
                 let Some(r) = atlas.sprites.get("entity/trident/trident").copied() else {
@@ -7467,7 +7467,7 @@ impl Game<'_> {
             // ShulkerBulletRenderer: the tumbling bullet model, then a larger
             // translucent copy of it (colour 0x26FFFFFF); always 15 block light.
             if matches!(a.kind, ProjectileKind::ShulkerBullet { .. }) {
-                let model = &self.entity_models.shulker_bullet;
+                let model = &self.model_assets.entity_models.shulker_bullet;
                 if let (Some(model), Some(r)) =
                     (model, atlas.sprites.get("entity/shulker/spark").copied())
                 {
@@ -7519,7 +7519,7 @@ impl Game<'_> {
             }
             // WitherSkullRenderer: the skull model facing its flight.
             if let Some(dangerous) = super::wither::skull_kind(a) {
-                let model = &self.entity_models.wither_skull;
+                let model = &self.model_assets.entity_models.wither_skull;
                 let tex = if dangerous {
                     "entity/wither/wither_invulnerable"
                 } else {
