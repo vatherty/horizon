@@ -968,7 +968,7 @@ impl Game<'_> {
     }
     /// ThrownTridentRenderer.
     pub(super) fn trident_geometry(&self, camera: glam::DVec3, alpha: f64, out: &mut Vec<Vertex>) {
-        let Some(model) = &self.trident_model else {
+        let Some(model) = &self.model_assets.trident_model else {
             return;
         };
         let Some(uv) = self
