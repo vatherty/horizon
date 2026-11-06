@@ -344,37 +344,43 @@ pub(super) fn preload_world_data(
     on_world_screens: bool,
     resources: &std::path::Path,
     registry: &'static horizon_world::registry::BlockRegistry,
+    workers: usize,
 ) {
     let mut preload = PRELOAD.lock().unwrap_or_else(|e| e.into_inner());
     match &mut *preload {
         Preload::Used => {}
         Preload::Idle if on_world_screens => {
             let resources = resources.to_owned();
+            let budget = horizon_threads::loading::Budget::new(workers);
             let spawned = std::thread::Builder::new()
                 .name("World data preload".into())
                 .spawn(move || {
-                    horizon_threads::behind_server();
-                    let sync = spawn_sync_preload(&resources, true);
-                    // Errors are left for the world opening to report.
-                    if let Ok(data) = horizon_client::vanillagen::shared_data(
-                        &resources.join("worldgen"),
-                        registry,
-                    ) {
-                        // The Overworld's feature decoration, which every
-                        // seed shares: about 140 ms off opening the world.
-                        let _ = data.prepare_decoration("minecraft:normal", "minecraft:overworld");
-                    }
-                    // The loot data's item tables and the server's data both
-                    // read the recipe folder: held here, it is read once.
-                    let _recipe_files =
-                        horizon_client::json_folder::read(&resources.join("data/minecraft/recipe"));
-                    // The preload is the game's own data; the world's packs'
-                    // tables are built when it opens (finish_open_world).
-                    let _ = horizon_client::structure_blocks::loot_data(
-                        &resources,
-                        &horizon_world::loot::PackOverlay::NONE,
-                    );
-                    join_sync_preload(sync, &resources);
+                    budget.run(|| {
+                        horizon_threads::behind_server();
+                        let sync = spawn_sync_preload(&resources, true);
+                        // Errors are left for the world opening to report.
+                        if let Ok(data) = horizon_client::vanillagen::shared_data(
+                            &resources.join("worldgen"),
+                            registry,
+                        ) {
+                            // The Overworld's feature decoration, which every
+                            // seed shares: about 140 ms off opening the world.
+                            let _ =
+                                data.prepare_decoration("minecraft:normal", "minecraft:overworld");
+                        }
+                        // The loot data's item tables and the server's data both
+                        // read the recipe folder: held here, it is read once.
+                        let _recipe_files = horizon_client::json_folder::read(
+                            &resources.join("data/minecraft/recipe"),
+                        );
+                        // The preload is the game's own data; the world's packs'
+                        // tables are built when it opens (finish_open_world).
+                        let _ = horizon_client::structure_blocks::loot_data(
+                            &resources,
+                            &horizon_world::loot::PackOverlay::NONE,
+                        );
+                        join_sync_preload(sync, &resources);
+                    })
                 });
             match spawned {
                 Ok(thread) => *preload = Preload::Started { thread, left: None },
@@ -418,40 +424,43 @@ pub(super) fn preload_launch_world(
     };
     let world_root = dir.join("saves").join(folder);
     let resources = resources.to_owned();
+    let budget = horizon_threads::loading::Budget::current();
     let spawned = std::thread::Builder::new()
         .name("World data preload".into())
         .spawn(move || {
-            // Not behind the server: the world's opening waits for it.
-            let started = std::time::Instant::now();
-            let sync = spawn_sync_preload(&resources, false);
-            // Errors are left for the world opening to report. The world's
-            // flags from its level.dat: the feature packs a flag forces on.
-            let enabled_features = horizon_client::save::Level::read(&world_root)
-                .map(|l| l.enabled_features)
-                .unwrap_or_default();
-            let (overrides, _) =
-                worldgen_overrides_of(&world_root, &resources, &biomes, &enabled_features);
-            if let Ok(data) = horizon_client::vanillagen::shared_data_with(
-                &resources.join("worldgen"),
-                &overrides,
-                registry,
-            ) {
-                let preset = horizon_client::save::WorldGen::preset(&world_root);
-                let _ = data.prepare_decoration(preset, "minecraft:overworld");
-            }
-            // As in `preload_world_data`: the loot data and the server's
-            // data share one read of the recipe folder.
-            let _recipe_files =
-                horizon_client::json_folder::read(&resources.join("data/minecraft/recipe"));
-            let _ = horizon_client::structure_blocks::loot_data(
-                &resources,
-                &horizon_world::loot::PackOverlay::NONE,
-            );
-            join_sync_preload(sync, &resources);
-            log::info!(
-                "Horizon: world data preloaded for the launch's world in {} ms",
-                started.elapsed().as_millis()
-            );
+            budget.run(|| {
+                // Not behind the server: the world's opening waits for it.
+                let started = std::time::Instant::now();
+                let sync = spawn_sync_preload(&resources, false);
+                // Errors are left for the world opening to report. The world's
+                // flags from its level.dat: the feature packs a flag forces on.
+                let enabled_features = horizon_client::save::Level::read(&world_root)
+                    .map(|l| l.enabled_features)
+                    .unwrap_or_default();
+                let (overrides, _) =
+                    worldgen_overrides_of(&world_root, &resources, &biomes, &enabled_features);
+                if let Ok(data) = horizon_client::vanillagen::shared_data_with(
+                    &resources.join("worldgen"),
+                    &overrides,
+                    registry,
+                ) {
+                    let preset = horizon_client::save::WorldGen::preset(&world_root);
+                    let _ = data.prepare_decoration(preset, "minecraft:overworld");
+                }
+                // As in `preload_world_data`: the loot data and the server's
+                // data share one read of the recipe folder.
+                let _recipe_files =
+                    horizon_client::json_folder::read(&resources.join("data/minecraft/recipe"));
+                let _ = horizon_client::structure_blocks::loot_data(
+                    &resources,
+                    &horizon_world::loot::PackOverlay::NONE,
+                );
+                join_sync_preload(sync, &resources);
+                log::info!(
+                    "Horizon: world data preloaded for the launch's world in {} ms",
+                    started.elapsed().as_millis()
+                );
+            })
         });
     match spawned {
         Ok(thread) => *preload = Preload::Started { thread, left: None },
@@ -468,13 +477,16 @@ fn spawn_sync_preload(
     behind_server: bool,
 ) -> Option<std::thread::JoinHandle<()>> {
     let resources = resources.to_owned();
+    let budget = horizon_threads::loading::Budget::current();
     std::thread::Builder::new()
         .name("Sync data preload".into())
         .spawn(move || {
-            if behind_server {
-                horizon_threads::behind_server();
-            }
-            let _ = super::lan::sync_data(&resources, &horizon_world::loot::PackOverlay::NONE);
+            budget.run(|| {
+                if behind_server {
+                    horizon_threads::behind_server();
+                }
+                let _ = super::lan::sync_data(&resources, &horizon_world::loot::PackOverlay::NONE);
+            })
         })
         .ok()
 }
@@ -484,7 +496,7 @@ fn spawn_sync_preload(
 fn join_sync_preload(sync: Option<std::thread::JoinHandle<()>>, resources: &std::path::Path) {
     match sync {
         Some(thread) => {
-            let _ = thread.join();
+            let _ = horizon_threads::loading::Budget::current().suspend(|| thread.join());
         }
         None => {
             let _ = super::lan::sync_data(resources, &horizon_world::loot::PackOverlay::NONE);
