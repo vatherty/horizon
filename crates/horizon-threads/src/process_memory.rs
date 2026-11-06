@@ -1,4 +1,50 @@
 //! Read-only process memory diagnostics.
+/// OS observations, in bytes. These overlap and must never be added together,
+/// or to allocator/GPU capacities. `None` means unavailable, not zero.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Observations {
+    pub resident: Option<u64>,
+    /// The OS's physical footprint, including memory beyond the resident set.
+    pub footprint: Option<u64>,
+    /// Memory the current process may still allocate (not system free RAM).
+    pub available: Option<u64>,
+}
+
+/// Supported iOS SDK APIs, compiled against the target's Mach headers.
+#[cfg(target_os = "ios")]
+pub fn observations() -> Observations {
+    unsafe extern "C" {
+        fn horizon_process_memory_ios(
+            resident: *mut u64,
+            footprint: *mut u64,
+            available: *mut u64,
+        ) -> u32;
+    }
+    let (mut resident, mut footprint, mut available) = (0, 0, 0);
+    // SAFETY: the SDK shim writes one u64 to each valid, distinct output and
+    // returns a validity bit for each independently successful observation.
+    let known =
+        unsafe { horizon_process_memory_ios(&mut resident, &mut footprint, &mut available) };
+    Observations {
+        resident: (known & 1 != 0).then_some(resident),
+        footprint: (known & 2 != 0).then_some(footprint),
+        available: (known & 4 != 0).then_some(available),
+    }
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn observations() -> Observations {
+    Observations {
+        resident: resident_bytes(),
+        ..Default::default()
+    }
+}
+
+#[cfg(target_os = "ios")]
+pub fn resident_bytes() -> Option<u64> {
+    observations().resident
+}
+
 /// The process's memory counters.
 #[cfg(windows)]
 fn counters() -> Option<windows_sys::Win32::System::ProcessStatus::PROCESS_MEMORY_COUNTERS> {
@@ -33,8 +79,7 @@ pub fn resident_bytes() -> Option<u64> {
 }
 
 /// The memory this process holds in RAM, in bytes.
-/// macOS only: `libc` does not expose `proc_pidinfo` on iOS, so iOS takes
-/// the unknown fallback below.
+/// macOS's libproc API; iOS uses the supported Mach SDK calls above.
 #[cfg(all(target_vendor = "apple", target_os = "macos"))]
 pub fn resident_bytes() -> Option<u64> {
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
@@ -58,6 +103,7 @@ pub fn resident_bytes() -> Option<u64> {
     windows,
     target_os = "linux",
     target_os = "android",
+    target_os = "ios",
     all(target_vendor = "apple", target_os = "macos")
 )))]
 pub fn resident_bytes() -> Option<u64> {
