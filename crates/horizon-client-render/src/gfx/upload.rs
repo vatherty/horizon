@@ -4,6 +4,8 @@
 //! texture writes a spike on every tick that changes a frame. The belt keeps a
 //! few mapped buffers and records the copies into the frame's encoder instead.
 use std::num::NonZeroU64;
+mod budget;
+pub use budget::MeshUploadBudget;
 
 /// Large enough for a tick of animated sprites at 16x16 with every mip level.
 const CHUNK: u64 = 1 << 20;
