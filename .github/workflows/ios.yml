@@ -59,6 +59,10 @@ jobs:
       # the iOS SDK, which the macOS runner has; the Linux VM does not).
       - name: Formatting (ios crate)
         run: cargo fmt --check --manifest-path ios/Cargo.toml
+      - name: iOS graphics backend regression
+        # Run on the host: this checks iOS selection without an attached phone.
+        # A target-only cargo check cannot catch choosing Vulkan instead of Metal.
+        run: cargo test --locked -p horizon-client-render --lib gfx::tests::ios_uses_metal_for_every_saved_graphics_api
       - name: Cargo check for the iOS target
         run: cargo check --target aarch64-apple-ios --manifest-path ios/Cargo.toml
       - name: Clippy for the iOS target
