@@ -578,25 +578,26 @@ impl Game<'_> {
         let start_step = self.ticks;
         let start_state = keyframe_state(self.state_value());
 
-        // Save, then copy with the world frozen: the integrated server keeps
-        // ticking and autosaving otherwise, and a region file would tear.
+        // Save and copy as one owner-thread job: no world tick or autosave can
+        // run between the flush and copy, including in a published LAN world.
         if include_world {
             let root = world_root.as_ref().expect("a local world's save folder");
             if let Some(server) = self.integrated.as_ref() {
-                server.set_paused(true);
-                let saved = server.call(|game| game.save_game().map_err(|e| e.to_string()));
-                let copied = copy_tree(root, &dir.join("world"));
-                server.set_paused(self.pause);
-                match saved {
-                    Some(Ok(())) => {}
-                    Some(Err(e)) => {
-                        return Err(format!("saving the world for the recording: {e}").into());
-                    }
-                    None => {
-                        log::warn!("Horizon: the integrated server did not save for the recording")
-                    }
-                }
-                copied.map_err(|e| format!("copying the world: {e}"))?;
+                let root = root.clone();
+                let destination = dir.join("world");
+                server
+                    .call(move |game| {
+                        game.save_game()
+                            .map_err(|e| format!("saving the world for the recording: {e}"))?;
+                        copy_tree(&root, &destination)
+                            .map_err(|e| format!("copying the world: {e}"))
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "recording snapshot was not confirmed: {}",
+                            super::integrated::NO_ANSWER
+                        )
+                    })??;
             } else {
                 self.save_game_with(true)?;
                 copy_tree(root, &dir.join("world"))
