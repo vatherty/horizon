@@ -653,17 +653,15 @@ impl Game<'_> {
             has_overlay: false,
         };
         let limit = framerate_limit(self.settings.max_fps as i32, context);
-        let limit = self
-            .settings
-            .horizon
-            .battery_limit(limit, self.title.is_none(), self.focused);
-        // A phone that has warmed up draws fewer frames (never a cap off a phone).
-        let limit = match horizon_client::platform::thermal_fps_cap(
-            horizon_client::platform::thermal_status(),
-        ) {
-            Some(cap) => limit.min(cap as i32),
-            None => limit,
-        };
+        let limit = horizon_client::platform::effective_fps_cap(
+            limit.max(1) as u32,
+            self.settings.horizon.battery,
+            self.title.is_none()
+                && self.player.is_some()
+                && self.screen == super::Screen::Playing
+                && !self.screen_over_playing(),
+            self.focused,
+        ) as i32;
         // A native mod may only lower it (`native_framerate_limit`).
         let mut hooked = limit;
         self.native_framerate_limit(
@@ -686,6 +684,9 @@ impl Game<'_> {
             return;
         }
         let limit = self.framerate_limit();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_dynamic_frame_budget(limit.max(1) as u32);
+        }
         match self.settings.horizon.pacing {
             horizon_client::graphics::Pacing::Precise => {
                 horizon_client::window::end_frame(&mut self.limiter, limit, &mut self.frame_clock)
