@@ -9,6 +9,12 @@ on:
   push:
     branches: [ios-port]
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Update the phone download release after validation (pushes to ios-port always publish)
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 concurrency:
@@ -126,6 +132,7 @@ jobs:
       # content check above has passed by now). Install it with SideStore/AltStore, which signs it
       # with a free Apple ID; see ios/README.md.
       - name: Keep the ios-latest pre-release current
+        if: github.event_name == 'push' || inputs.publish_release
         env:
           GH_TOKEN: ${{ github.token }}
           IPA: ${{ steps.name.outputs.file }}
