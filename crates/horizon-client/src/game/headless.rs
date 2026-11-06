@@ -53,7 +53,7 @@ impl Game<'_> {
             exit: Cell::new(false),
             flow: Cell::new(ControlFlow::Poll),
         };
-        self.previous = Instant::now();
+        self.previous.resume(Instant::now());
         while !ctl.exit.get() {
             let started = Instant::now();
             ctl.flow.set(ControlFlow::Poll);
