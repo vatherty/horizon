@@ -36,6 +36,10 @@ enum Strings {
     static func resourcesFound(_ path: String) -> String {
         "Resources found in \(path)"
     }
+    static let resourcesFoundPrepared =
+        "Resources found in the prepared folder (.local/horizon-client)"
+    static let resourcesFoundArgs =
+        "Resources found where horizon-args.txt points (--resources)"
     static func importDestination(_ path: String) -> String {
         "Or put them there yourself:\n\(path)"
     }
@@ -47,6 +51,8 @@ enum Strings {
     static let startGame = "Start Horizon"
     static let startAnyway = "Start anyway (shows the error)"
     static let shareLog = "Share the log"
+    static let viewLog = "View the log"
+    static let startHint = "Close Horizon and open it again to play."
     static let dismiss = "Dismiss"
     static let importingHeading = "Importing the resources. This takes a few minutes; keep the app open."
     static let importedBody = "Imported. Close Horizon and open it again to play."
@@ -59,6 +65,16 @@ enum Strings {
     }
     static let pickZipTitle = "Pick the prepared-resources zip"
     static let pickFolderTitle = "Pick the prepared folder"
+
+    // MARK: Log screen
+
+    static let logScreenTitle = "Latest log"
+    static let logMissing =
+        "There is no log yet. Once the game has run, its log is logs/latest.log in the game folder."
+    static let logTruncatedNote =
+        "(Showing the end of the log; the beginning was left out to keep this screen fast.)"
+    static let shareButton = "Share"
+    static let closeButton = "Close"
 
     // MARK: Import progress
 
