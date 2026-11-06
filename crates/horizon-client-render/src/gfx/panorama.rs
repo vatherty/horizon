@@ -101,16 +101,7 @@ impl Faces {
 /// The faces' files decoded, side by side, into one array of six layers of
 /// equal squares.
 fn decode_faces(files: &[Vec<u8>]) -> Result<(u32, Vec<u8>)> {
-    let decoded: Vec<_> = std::thread::scope(|scope| {
-        let threads: Vec<_> = files
-            .iter()
-            .map(|file| scope.spawn(|| decode_bytes(file).map_err(|e| e.to_string())))
-            .collect();
-        threads
-            .into_iter()
-            .map(|t| t.join().unwrap_or_else(|p| std::panic::resume_unwind(p)))
-            .collect()
-    });
+    let decoded = crate::par::par_map(files, |file| decode_bytes(file).map_err(|e| e.to_string()));
     let mut size = 0;
     let mut texels = Vec::new();
     for (face, image) in FACE_ORDER.iter().zip(decoded) {
