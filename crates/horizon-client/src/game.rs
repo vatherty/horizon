@@ -186,14 +186,18 @@ mod launch_api;
 mod leads;
 mod level_particles;
 mod levels;
+mod lifecycle;
 mod lightning;
 mod llamas;
+mod loading_schedule;
+mod local_performance;
 mod locator_bar;
 mod loom;
 mod mace;
 mod machines;
 mod maps;
 mod memory;
+mod mesh_uploads;
 mod minecarts;
 mod mob_blocks;
 mod mob_gear;
@@ -488,8 +492,6 @@ const AUTO_UPLOAD_TIME: Duration = Duration::from_millis(2);
 /// open, a teleport): the meshes waiting then are the view itself, not edits
 /// to it, so a frame gives them more of its time to fill the view sooner.
 const AUTO_UPLOAD_TIME_ARRIVING: Duration = Duration::from_millis(6);
-/// A frame's finished meshes up to this many upload at once, unqueued.
-const AUTO_UPLOADS_AT_ONCE: usize = 8;
 
 #[derive(Clone)]
 struct Options {
@@ -2183,22 +2185,22 @@ impl UiResources {
     pub fn load(root: &std::path::Path, defaults: &std::path::Path) -> Result<Self> {
         // The title screen waits for both: the panorama's six faces decode
         // beside the atlas.
-        std::thread::scope(|scope| {
-            let panorama = named_scope(scope, "panorama", || {
-                startup::time("ui.panorama", || {
-                    horizon_client::gfx::panorama::Faces::load(root, defaults)
+        horizon_threads::loading::Budget::current().run(|| {
+            std::thread::scope(|scope| {
+                let panorama = Step::spawn(scope, true, "panorama", || {
+                    startup::time("ui.panorama", || {
+                        horizon_client::gfx::panorama::Faces::load(root, defaults)
+                    })
+                });
+                let mod_image = crate::game::mods::built_with_native_mods();
+                let atlas = startup::time("ui.atlas", || {
+                    HudAtlas::build_over_with_image(root, defaults, mod_image)
+                });
+                let panorama = panorama.join();
+                Ok(Self {
+                    atlas: atlas?,
+                    panorama: Arc::new(panorama),
                 })
-            });
-            let mod_image = crate::game::mods::built_with_native_mods();
-            let atlas = startup::time("ui.atlas", || {
-                HudAtlas::build_over_with_image(root, defaults, mod_image)
-            });
-            let panorama = panorama
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-            Ok(Self {
-                atlas: atlas?,
-                panorama: Arc::new(panorama),
             })
         })
     }
@@ -2217,6 +2219,7 @@ impl UiResources {
 /// cloning shares the loaded data.
 #[derive(Clone)]
 pub struct PackResources {
+    game_cpu: Arc<std::sync::OnceLock<std::result::Result<GameCpuResources, String>>>,
     assets: Arc<Assets>,
     render: Arc<RenderAssets>,
     context: Arc<WorkerContext>,
@@ -2283,6 +2286,7 @@ impl PackResources {
         light: Arc<LightTables>,
     ) -> Self {
         Self {
+            game_cpu: Arc::new(std::sync::OnceLock::new()),
             layer_names: Arc::new(
                 render
                     .sprite_layers
@@ -2605,6 +2609,8 @@ struct Game<'a> {
     observed_screen: Option<native_hooks::ObservedScreen>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// Native lifecycle suspension is independent of the player's pause screen.
+    lifecycle_suspended: bool,
     /// Avoid an endless rebuild loop if the new device is lost as well.
     last_device_recovery: Option<Instant>,
     /// CPU geometry storage retained across frames, including empty/title frames.
@@ -2633,7 +2639,7 @@ struct Game<'a> {
     started: Instant,
     /// `SpectatorGui`: the menu a spectator opens with the hotbar keys.
     spectator_gui: horizon_client::spectator_menu::SpectatorGui,
-    previous: Instant,
+    previous: lifecycle::FrameTime,
     /// When the last frame's work ended: what runs before the next one starts (`idle`, the
     /// event loop) shows in HORIZON_SPIKES as the time between frames.
     frame_end: Instant,
@@ -2900,14 +2906,10 @@ struct Game<'a> {
     falling: horizon_client::join_seq::JoinList<FallingBlock>,
     /// Blocks the server shows for a moment (`ClientboundAddTransientBlockPacket`).
     transient_blocks: transient_blocks::TransientBlocks,
+    /// One immutable resource generation, shared with integrated/server Games.
+    model_assets: Arc<GameCpuAssets>,
     paintings: Vec<horizon_client::entities::Painting>,
-    painting_variants: paintings::PaintingVariants,
     item_frames: Vec<horizon_client::entities::ItemFrame>,
-    frame_model: frames::FrameModel,
-    glow_frame_model: frames::FrameModel,
-    /// The `map=true` frame variants.
-    map_frame_model: frames::FrameModel,
-    glow_map_frame_model: frames::FrameModel,
     armor_stands: horizon_client::join_seq::JoinList<horizon_client::entities::ArmorStand>,
     /// `Cushion` decoration entities (game/cushions.rs).
     cushions: Vec<horizon_client::entities::Cushion>,
@@ -2934,13 +2936,6 @@ struct Game<'a> {
     boats: horizon_client::join_seq::JoinList<boats::Boat>,
     /// The boats a mob's lead can hang on, for this tick's mob ticks.
     leash_boats: Vec<(u32, horizon_client::mobs::leash::HolderState)>,
-    boat_models: boats::BoatModels,
-    /// EndCrystalModel's baked layer.
-    crystal_model: Option<horizon_client::mobs::Part>,
-    /// CushionModel's baked layer.
-    cushion_model: Option<horizon_client::mobs::Part>,
-    /// Models drawn only once such an entity shows up (lead knots, wind charges...).
-    entity_models: EntityModels,
     carts: horizon_client::join_seq::JoinList<minecarts::Minecart>,
     /// The boats and minecarts `native_vehicle_moved` follows (lan_vehicles.rs).
     watched_vehicles: Vec<lan_vehicles::WatchedVehicle>,
@@ -2954,7 +2949,6 @@ struct Game<'a> {
     crystals: Vec<dragon::Crystal>,
     dragon_fireballs: Vec<dragon::DragonFireball>,
     breath_clouds: Vec<dragon::Breath>,
-    dragon_model: Option<horizon_client::mobs::Part>,
     /// Map textures waiting for the next HUD batch to upload them.
     map_patches: Vec<horizon_client::font::Patch>,
     text_displays: std::collections::HashMap<i32, text_displays::RemoteTextDisplay>,
@@ -2983,7 +2977,6 @@ struct Game<'a> {
     skin_3d: RefCell<skin_models::SkinModels>,
     /// Atlas trim slots in use: (sprite name, slot), least recently drawn first.
     trim_slots: Vec<(String, usize)>,
-    cart_models: minecarts::CartModels,
     /// The boat the player rides.
     riding: Option<u32>,
     /// Vehicles that gained a rider this tick whose `START_RIDING_TRIGGER` was
@@ -3028,9 +3021,6 @@ struct Game<'a> {
     spawners: spawner::SpawnerState,
     /// Reused candidate buffers for natural spawning.
     spawn_scratch: natural_spawning::SpawnScratch,
-    trident_model: Option<horizon_client::mobs::Part>,
-    arrow_model: Option<horizon_client::mobs::Part>,
-    bee_stinger_model: Option<horizon_client::mobs::Part>,
     tnts: horizon_client::join_seq::JoinList<tnt::PrimedTnt>,
     hoppers: HashMap<(i32, i32, i32), machines::HopperState>,
     /// The screen of a mod block's menu open on this client (`native_screen`).
@@ -3049,6 +3039,7 @@ struct Game<'a> {
     /// When an agent's last command came.
     agent_last: Option<Instant>,
     frame_stats: horizon_client::control::FrameStats,
+    local_performance: local_performance::LocalPerformance,
     /// This play session's frame and tick times, for opt-in performance statistics.
     perf: horizon_client::telemetry::Session,
     /// Control replies waiting for a rendered frame or a benchmark deadline.
@@ -8332,7 +8323,12 @@ impl Game<'_> {
         self.has_singleplayer_server()
             && !self.is_published()
             && !self.has_split_players()
-            && self.title.is_none()
+            && self.screen_requests_pause()
+    }
+    /// The current screen's pause intent, without querying server eligibility.
+    /// Native lifecycle callbacks may publish this without a server-side lock.
+    fn screen_requests_pause(&self) -> bool {
+        self.title.is_none()
             && (matches!(
                 self.screen,
                 Screen::Paused
@@ -17504,77 +17500,40 @@ impl Game<'_> {
         if let Some(renderer) = self.renderer.as_mut() {
             let g = &self.settings.horizon;
             let budgeted = g.chunk_updates > 0 || g.upload_budget_kib > 0;
-            // The meshes, once copied, are freed by a worker (`Streaming::free`).
-            if !budgeted && self.pending_uploads.is_empty() && uploads.len() <= AUTO_UPLOADS_AT_ONCE
-            {
-                horizon_client::spans::time("upload", || {
-                    for (key, mesh) in &uploads {
-                        renderer.upload(*key, mesh);
-                    }
-                });
-                self.streaming.free(uploads);
+            // Every arrival, including a small batch, obeys the elapsed deadline.
+            // Superseded and unloaded meshes go back to Streaming's worker.
+            let pending = &mut self.pending_uploads;
+            let chunks = &self.world.chunks;
+            let mut spent = mesh_uploads::merge(
+                pending,
+                uploads,
+                |key| chunks.contains_key(&(key.0, key.2)),
+                self.streaming.center,
+            );
+            let auto_time = if arriving {
+                AUTO_UPLOAD_TIME_ARRIVING
             } else {
-                // Horizon's chunk-update and upload budgets: the nearest
-                // sections go first, the rest wait for later frames; a newer
-                // mesh of a waiting section replaces it, and sections of
-                // chunks no longer loaded are dropped.
-                let pending = &mut self.pending_uploads;
-                let fresh: horizon_client::fast_hash::FxHashSet<(i32, i32, i32)> =
-                    uploads.iter().map(|(k, _)| *k).collect();
-                let chunks = &self.world.chunks;
-                let loaded = |k: &(i32, i32, i32)| chunks.contains_key(&(k.0, k.2));
-                let mut spent: Vec<_> = pending
-                    .extract_if(.., |(k, _)| fresh.contains(k) || !loaded(k))
-                    .collect();
-                for upload in uploads {
-                    if loaded(&upload.0) {
-                        pending.push(upload);
-                    } else {
-                        spent.push(upload);
-                    }
+                AUTO_UPLOAD_TIME
+            };
+            let mut budget = horizon_client::gfx::MeshUploadBudget::new(
+                g.chunk_updates as usize,
+                u64::from(g.upload_budget_kib) * 1024,
+                (!budgeted).then_some(auto_time),
+            );
+            let started = Instant::now();
+            while let Some((_, mesh)) = pending.last() {
+                let bytes = ((mesh.solid.len() + mesh.translucent.len())
+                    * std::mem::size_of::<horizon_client::mesher::TerrainVertex>())
+                    as u64;
+                if !budget.allows(bytes, started.elapsed()) {
+                    break;
                 }
-                let centre = self.streaming.center;
-                let far = |k: &(i32, i32, i32)| (k.0 - centre.0).pow(2) + (k.2 - centre.1).pow(2);
-                pending.sort_unstable_by_key(|(k, _)| std::cmp::Reverse(far(k)));
-                let (limit, budget) = if budgeted {
-                    (
-                        g.chunk_updates as usize,
-                        u64::from(g.upload_budget_kib) * 1024,
-                    )
-                } else {
-                    (0, 0)
-                };
-                let (mut count, mut bytes) = (0, 0u64);
-                // Without the player's budgets, uploads stop once they took
-                // AUTO_UPLOAD_TIME of this frame (at least one goes): a burst of
-                // finished meshes spreads over frames, nearest first.
-                let auto = !budgeted;
-                let auto_time = if arriving {
-                    AUTO_UPLOAD_TIME_ARRIVING
-                } else {
-                    AUTO_UPLOAD_TIME
-                };
-                let started = Instant::now();
-                while let Some((_, mesh)) = pending.last() {
-                    if auto && count > 0 && started.elapsed() >= auto_time {
-                        break;
-                    }
-                    let size = ((mesh.solid.len() + mesh.translucent.len())
-                        * std::mem::size_of::<horizon_client::mesher::TerrainVertex>())
-                        as u64;
-                    if (limit > 0 && count >= limit)
-                        || (budget > 0 && bytes > 0 && bytes + size > budget)
-                    {
-                        break;
-                    }
-                    let (key, mesh) = pending.pop().expect("checked above");
-                    renderer.upload(key, &mesh);
-                    spent.push((key, mesh));
-                    count += 1;
-                    bytes += size;
-                }
-                self.streaming.free(spent);
+                let (key, mesh) = pending.pop().expect("checked above");
+                renderer.upload(key, &mesh);
+                spent.push((key, mesh));
+                budget.uploaded(bytes);
             }
+            self.streaming.free(spent);
             renderer.remove_columns(unloaded.iter().map(|c| (c.x, c.z)));
             // Meshes in the works are the view's terrain while it is new, then edits'.
             let meshing = self.streaming.busy() || !self.pending_uploads.is_empty();
@@ -17681,7 +17640,7 @@ impl ApplicationHandler for Game<'_> {
         self.ime_allowed = false;
         self.ime_area = None;
         self.apply_settings();
-        self.previous = Instant::now();
+        self.previous.resume(Instant::now());
     }
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         self.surface_lost();
@@ -18988,18 +18947,20 @@ impl Game<'_> {
                     self.mapped_key_event(key, event.state == ElementState::Pressed, event.repeat)?;
                 }
                 WindowEvent::RedrawRequested => {
+                    if self.lifecycle_suspended {
+                        return Ok(());
+                    }
                     horizon_client::spans::time("recover_device", || self.recover_device())?;
                     self.observe_fullscreen();
                     self.sync_ime();
                     let now = Instant::now();
-                    let frame_cpu = self
-                        .options
-                        .spikes
-                        .and_then(|_| horizon_client::spans::thread_cpu());
-                    let elapsed = now.duration_since(self.previous);
+                    let frame_cpu = (self.options.spikes.is_some()
+                        || self.local_performance.enabled())
+                    .then(horizon_client::spans::thread_cpu)
+                    .flatten();
+                    let elapsed = self.previous.advance(now);
                     let between = now.saturating_duration_since(self.frame_end);
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
-                    self.previous = now;
                     // Arrow-key camera controls belong to gameplay; chat and
                     // other screens use the same keys for their own navigation.
                     if self.screen == Screen::Playing
@@ -19131,12 +19092,41 @@ impl Game<'_> {
                                 .record_block_entities(r.static_block_entity_frame_stats());
                         }
                         self.frame_stats.record_gpu(&r.gpu_times);
+                        if rendered {
+                            let worked = frame_cpu.and_then(|start| {
+                                horizon_client::spans::thread_cpu()
+                                    .and_then(|end| end.checked_sub(start))
+                            });
+                            self.local_performance.record_at(
+                                Instant::now(),
+                                worked,
+                                cpu,
+                                &r.gpu_times,
+                            );
+                        }
                         r.gpu_times.clear();
+                    }
+                    let local_now = Instant::now();
+                    if self.local_performance.due(local_now)
+                        && let Some(renderer) = &self.renderer
+                    {
+                        let details = performance_details(
+                            renderer,
+                            &self.settings,
+                            if self.player.is_some() {
+                                "world"
+                            } else {
+                                "menu"
+                            },
+                            self.framerate_limit().max(1) as u32,
+                            serde_json::json!({"mesh_uploads":self.pending_uploads.len(), "streaming_jobs":self.streaming.pending()}),
+                        );
+                        self.local_performance.publish(local_now, details);
                     }
                     self.limit_frame();
                     self.pause = self.pauses_game();
                     if let Some(server) = &self.integrated {
-                        server.set_paused(self.pause);
+                        server.set_paused(self.screen_requests_pause());
                         server.set_distances(
                             self.settings.render_distance,
                             self.settings.simulation_distance,
@@ -19291,6 +19281,10 @@ impl Game<'_> {
             }
             return;
         }
+        if self.lifecycle_suspended {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
         if let Err(error) = horizon_client::spans::time("world_entry", || self.resume_world_entry())
         {
             self.error = Some(error);
@@ -19397,6 +19391,12 @@ impl<'a> Game<'a> {
         audio: Audio,
         prepared: Option<GameCpuResources>,
     ) -> Result<Self> {
+        let local_performance =
+            if prepared.is_none() && options.execution_role.is_client() && !options.headless {
+                local_performance::LocalPerformance::new(performance_path(), Instant::now())
+            } else {
+                Default::default()
+            };
         let root = options.resources.clone();
         let registry = pack.assets.registry;
         // Until a world is opened the streamer is idle.
@@ -19415,7 +19415,7 @@ impl<'a> Game<'a> {
         ));
         let prepared = prepared
             .map(Ok)
-            .unwrap_or_else(|| GameCpuResources::load(&root))?;
+            .unwrap_or_else(|| GameCpuResources::for_pack(&root, &pack))?;
         let world = World::new(res.facts().air, 0);
         let tutorial = tutorial::Tutorial::new(tutorial::Step::from_option(
             settings.file.int("tutorialStep"),
@@ -19540,6 +19540,7 @@ impl<'a> Game<'a> {
             window: None,
             renderer: None,
             last_device_recovery: None,
+            lifecycle_suspended: false,
             entity_vertices: Vec::new(),
             dynamic_lights: Vec::new(),
             luminance: Default::default(),
@@ -19554,7 +19555,7 @@ impl<'a> Game<'a> {
             health_hud: hud_layout::HealthHud::default(),
             started: now,
             spectator_gui: Default::default(),
-            previous: now,
+            previous: lifecycle::FrameTime::new(now),
             frame_end: now,
             last_input: now,
             pad: Default::default(),
@@ -19705,17 +19706,13 @@ impl<'a> Game<'a> {
             falling: Default::default(),
             transient_blocks: Default::default(),
             paintings: Vec::new(),
-            painting_variants: prepared.painting_variants,
             item_frames: Vec::new(),
-            frame_model: prepared.frame_model,
-            glow_frame_model: prepared.glow_frame_model,
-            map_frame_model: prepared.map_frame_model,
-            glow_map_frame_model: prepared.glow_map_frame_model,
             armor_stands: Default::default(),
             cushions: Vec::new(),
             others: Vec::new(),
-            armor_stand_assets: prepared.armor_stand_assets,
-            waypoint_styles: prepared.waypoint_styles,
+            model_assets: prepared.assets.clone(),
+            armor_stand_assets: prepared.assets.armor_stand_assets.clone(),
+            waypoint_styles: prepared.assets.waypoint_styles.clone(),
             waypoints: Default::default(),
             locator_camera: None,
             native_camera_frame: None,
@@ -19725,10 +19722,6 @@ impl<'a> Game<'a> {
             experience_display: Default::default(),
             boats: Default::default(),
             leash_boats: Vec::new(),
-            boat_models: prepared.boat_models,
-            crystal_model: prepared.crystal_model,
-            cushion_model: prepared.cushion_model,
-            entity_models: prepared.entity_models,
             carts: Default::default(),
             watched_vehicles: Vec::new(),
             jukebox_sounds: HashMap::new(),
@@ -19739,7 +19732,6 @@ impl<'a> Game<'a> {
             crystals: Vec::new(),
             dragon_fireballs: Vec::new(),
             breath_clouds: Vec::new(),
-            dragon_model: prepared.dragon_model,
             map_patches: Vec::new(),
             text_displays: Default::default(),
             interactions: Default::default(),
@@ -19762,7 +19754,6 @@ impl<'a> Game<'a> {
             emote_wheel: Default::default(),
             skin_3d: Default::default(),
             trim_slots: Vec::new(),
-            cart_models: prepared.cart_models,
             riding: None,
             started_riding: Vec::new(),
             boarding_cooldown: 0,
@@ -19784,9 +19775,6 @@ impl<'a> Game<'a> {
             creaking: Default::default(),
             spawners: Default::default(),
             spawn_scratch: Default::default(),
-            trident_model: prepared.trident_model,
-            arrow_model: prepared.arrow_model,
-            bee_stinger_model: prepared.bee_stinger_model,
             tnts: Default::default(),
             hoppers: HashMap::new(),
             mod_screen: None,
@@ -19798,6 +19786,7 @@ impl<'a> Game<'a> {
             agent_control_on: false,
             agent_last: None,
             frame_stats: Default::default(),
+            local_performance,
             perf: Default::default(),
             pending_screenshot: None,
             pending_render_capture: None,
@@ -19951,7 +19940,14 @@ impl<'a> Game<'a> {
 
 /// CPU-only startup data, owned by one loader generation. No file reads or
 /// model baking are needed when the event loop installs this bundle.
+#[derive(Clone)]
 struct GameCpuResources {
+    assets: Arc<GameCpuAssets>,
+    creative_screen: Creative,
+}
+/// Read-only models and gameplay lookups shared with the integrated server.
+/// Boat model availability and painting variants are gameplay inputs too.
+struct GameCpuAssets {
     painting_variants: paintings::PaintingVariants,
     frame_model: frames::FrameModel,
     glow_frame_model: frames::FrameModel,
@@ -19968,7 +19964,6 @@ struct GameCpuResources {
     bee_stinger_model: Option<horizon_client::mobs::Part>,
     trident_model: Option<horizon_client::mobs::Part>,
     entity_models: EntityModels,
-    creative_screen: Creative,
 }
 /// Baked layers of entities that may first show up deep into a session. They come from the
 /// document parsed once at startup: parsing entity-models.json (2.4 MB) when the first one
@@ -20003,26 +19998,41 @@ impl EntityModels {
     }
 }
 impl GameCpuResources {
+    fn for_pack(root: &std::path::Path, pack: &PackResources) -> Result<Self> {
+        Self::cached(root, &pack.game_cpu)
+    }
+    fn cached(
+        root: &std::path::Path,
+        cache: &std::sync::OnceLock<std::result::Result<Self, String>>,
+    ) -> Result<Self> {
+        cache
+            .get_or_init(|| Self::load(root).map_err(|e| e.to_string()))
+            .as_ref()
+            .cloned()
+            .map_err(|e| e.clone().into())
+    }
     fn load(root: &std::path::Path) -> Result<Self> {
         let document = horizon_client::mobs::EntityModelDocument::load(root).ok();
         let model = |key| document.as_ref().and_then(|document| document.model(key));
         Ok(Self {
-            painting_variants: paintings::PaintingVariants::load(root),
-            frame_model: frames::bake_frame(root, "item_frame"),
-            glow_frame_model: frames::bake_frame(root, "glow_item_frame"),
-            map_frame_model: frames::bake_frame(root, "item_frame_map"),
-            glow_map_frame_model: frames::bake_frame(root, "glow_item_frame_map"),
-            armor_stand_assets: armor_stands::ArmorStandAssets::load(root, document.as_ref()),
-            waypoint_styles: horizon_client::locator_bar::WaypointStyles::load(root),
-            boat_models: boats::BoatModels::load(document.as_ref()),
-            cart_models: minecarts::CartModels::load(document.as_ref()),
-            crystal_model: model("minecraft:end_crystal#main"),
-            cushion_model: model("minecraft:cushion#main"),
-            dragon_model: model("minecraft:ender_dragon#main"),
-            arrow_model: model("minecraft:arrow#main"),
-            bee_stinger_model: model("minecraft:bee_stinger#main"),
-            trident_model: model("minecraft:trident#main"),
-            entity_models: EntityModels::load(document.as_ref()),
+            assets: Arc::new(GameCpuAssets {
+                painting_variants: paintings::PaintingVariants::load(root),
+                frame_model: frames::bake_frame(root, "item_frame"),
+                glow_frame_model: frames::bake_frame(root, "glow_item_frame"),
+                map_frame_model: frames::bake_frame(root, "item_frame_map"),
+                glow_map_frame_model: frames::bake_frame(root, "glow_item_frame_map"),
+                armor_stand_assets: armor_stands::ArmorStandAssets::load(root, document.as_ref()),
+                waypoint_styles: horizon_client::locator_bar::WaypointStyles::load(root),
+                boat_models: boats::BoatModels::load(document.as_ref()),
+                cart_models: minecarts::CartModels::load(document.as_ref()),
+                crystal_model: model("minecraft:end_crystal#main"),
+                cushion_model: model("minecraft:cushion#main"),
+                dragon_model: model("minecraft:ender_dragon#main"),
+                arrow_model: model("minecraft:arrow#main"),
+                bee_stinger_model: model("minecraft:bee_stinger#main"),
+                trident_model: model("minecraft:trident#main"),
+                entity_models: EntityModels::load(document.as_ref()),
+            }),
             creative_screen: Creative::load(root)?,
         })
     }
@@ -20125,6 +20135,7 @@ impl Game<'_> {
             on_world_screens,
             &self.options.resources,
             self.pack.assets.registry,
+            self.settings.horizon.worker_threads(),
         );
         if std::mem::take(&mut self.pending_pack_reload) {
             self.reload_packs();
@@ -20545,57 +20556,8 @@ fn launch_world(options: &Options) -> Option<&str> {
         .flatten()
 }
 
-/// A scoped thread with a name, for one step of the resource load.
-///
-/// Named because the heap census and the startup trace both fall back to the
-/// OS thread name: unnamed, every loader's retained memory and every span it
-/// ran landed in one `unnamed thread` bucket. That bucket was 330 MiB of a
-/// playing game's resident set -- the largest of all of them -- with nothing
-/// to say which loader held it, and 13 of the trace's 17 lanes were
-/// indistinguishable.
-fn named_scope<'scope, T: Send + 'scope>(
-    scope: &'scope std::thread::Scope<'scope, '_>,
-    name: &str,
-    f: impl FnOnce() -> T + Send + 'scope,
-) -> std::thread::ScopedJoinHandle<'scope, T> {
-    std::thread::Builder::new()
-        // Linux keeps 15 bytes of a thread name: a short prefix keeps them apart
-        // ("horizon-load-core" and "horizon-load-collision" would both read
-        // "horizon-load-co").
-        .name(format!("load-{name}"))
-        .spawn_scoped(scope, f)
-        // `Scope::spawn`, which this replaces, panics when the OS refuses a
-        // thread. Keeping that: a resource load cannot go on without it.
-        .expect("resource loader thread")
-}
-
-/// A step of the resource load: on its own scoped thread, or, when the
-/// settings allow a single worker, run where it is joined.
-enum Step<'scope, T> {
-    Thread(std::thread::ScopedJoinHandle<'scope, T>),
-    Later(Box<dyn FnOnce() -> T + Send + 'scope>),
-}
-impl<'scope, T: Send + 'scope> Step<'scope, T> {
-    /// `name` names the thread when one is spawned ([`named_scope`]).
-    fn spawn(
-        scope: &'scope std::thread::Scope<'scope, '_>,
-        parallel: bool,
-        name: &str,
-        f: impl FnOnce() -> T + Send + 'scope,
-    ) -> Self {
-        if parallel {
-            Self::Thread(named_scope(scope, name, f))
-        } else {
-            Self::Later(Box::new(f))
-        }
-    }
-    fn join(self) -> T {
-        match self {
-            Self::Thread(handle) => handle.join().unwrap(),
-            Self::Later(f) => f(),
-        }
-    }
-}
+/// Every nested loader and file map spends the same generation's budget.
+type Step<'scope, T> = horizon_threads::loading::Task<'scope, T>;
 
 /// The world bundle's core tables from one resource root, before
 /// `load_resources` binds them into the pack tables and `WorldCore`.
@@ -20639,14 +20601,14 @@ fn load_core(
     // second on the critical path, and warm it is still ~30 ms.
     // A server draws nothing and parses no models, so it skips this.
     let (assets, parsed_models) = std::thread::scope(|scope| {
-        let models = (parallel && !headless).then(|| {
-            scope.spawn(|| {
+        let models = (!headless).then(|| {
+            Step::spawn(scope, parallel, "models", || {
                 let _step = startup::step("core.models_parse");
                 horizon_client::model_library::ParsedModels::load(root)
             })
         });
         let assets = startup::time("core.assets", || Assets::load(root));
-        let models = models.map(|m| m.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+        let models = models.map(Step::join);
         (assets, models)
     });
     let assets = match assets {
@@ -20804,6 +20766,35 @@ fn gameplay_tables(
 /// the launch opens, whose data is preloaded meanwhile.
 #[allow(clippy::too_many_arguments)]
 fn load_resources(
+    root: PathBuf,
+    launch_world: Option<&str>,
+    vanilla_root: &std::path::Path,
+    settings: &Settings,
+    started: Instant,
+    menu: bool,
+    headless: bool,
+    progress: &Progress,
+    publish: &mut dyn FnMut(UiResources, &std::path::Path),
+) -> Result<Loaded> {
+    let budget =
+        horizon_threads::loading::Budget::current_or_new(settings.horizon.worker_threads());
+    budget.run(|| {
+        load_resources_in_budget(
+            root,
+            launch_world,
+            vanilla_root,
+            settings,
+            started,
+            menu,
+            headless,
+            progress,
+            publish,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_resources_in_budget(
     mut root: PathBuf,
     launch_world: Option<&str>,
     vanilla_root: &std::path::Path,
@@ -20964,35 +20955,38 @@ fn load_resources(
         let vanilla_root = vanilla_root.to_owned();
         let rest_progress = progress.clone();
         let progress = progress.clone();
+        let budget = horizon_threads::loading::Budget::current();
         let handle = std::thread::Builder::new()
             .name("world-rest-loader".into())
             .spawn(move || {
-                let _item_defaults = item_defaults;
-                let _step = startup::step("rest");
-                let rest = load_world_rest(
-                    &root,
-                    &resources,
-                    &assets,
-                    &behaviour_json,
-                    &gameplay_projection,
-                    visibility,
-                    &progress,
-                    started,
-                    true,
-                )
-                .map_err(|error| error.to_string())?;
-                resources
-                    .rest
-                    .set(rest)
-                    .map_err(|_| "world resources already loaded".to_owned())?;
-                progress.set(9);
-                horizon_client::telemetry::mark_rest_ready();
-                log::info!(
-                    "Horizon: rest-ready after {} ms",
-                    started.elapsed().as_millis()
-                );
-                write_prepared_files(vanilla_root);
-                Ok(())
+                budget.run(|| {
+                    let _item_defaults = item_defaults;
+                    let _step = startup::step("rest");
+                    let rest = load_world_rest(
+                        &root,
+                        &resources,
+                        &assets,
+                        &behaviour_json,
+                        &gameplay_projection,
+                        visibility,
+                        &progress,
+                        started,
+                        true,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    resources
+                        .rest
+                        .set(rest)
+                        .map_err(|_| "world resources already loaded".to_owned())?;
+                    progress.set(9);
+                    horizon_client::telemetry::mark_rest_ready();
+                    log::info!(
+                        "Horizon: rest-ready after {} ms",
+                        started.elapsed().as_millis()
+                    );
+                    write_prepared_files(vanilla_root);
+                    Ok(())
+                })
             })?;
         Some(WorldRestLoader {
             progress: rest_progress,
@@ -21027,14 +21021,17 @@ fn load_resources(
                     prepare_renderer_textures(&pack)
                 })
             });
-            let game_cpu = startup::time("handoff.game_cpu", || GameCpuResources::load(&root));
+            let game_cpu = startup::time("handoff.game_cpu", || {
+                GameCpuResources::for_pack(&root, &pack)
+            });
             (game_cpu, textures.join())
         });
         let game_cpu = match game_cpu {
             Ok(game_cpu) => game_cpu,
             Err(error) => {
                 if let Some(tail) = rest_loader {
-                    let _ = tail.handle.join();
+                    let _ =
+                        horizon_threads::loading::Budget::current().suspend(|| tail.handle.join());
                 }
                 return Err(error);
             }
@@ -21184,35 +21181,26 @@ fn load_world_rest(
     ) -> std::result::Result<T, String> {
         result.map_err(|e| e.to_string())
     }
-    let (items, behaviours, block_entity_render, animate, mobs, transformers) = if threads > 1 {
+    let (items, behaviours, block_entity_render, animate, mobs, transformers) =
         std::thread::scope(|scope| {
-            let items = named_scope(scope, "items", || text(load_items()));
-            let behaviours = named_scope(scope, "behaviours", || text(load_behaviours()));
-            let block_entity_render = named_scope(scope, "block_entity_render", || {
+            let parallel = threads > 1;
+            let items = Step::spawn(scope, parallel, "items", || text(load_items()));
+            let behaviours = Step::spawn(scope, parallel, "behaviours", || text(load_behaviours()));
+            let block_entity_render = Step::spawn(scope, parallel, "block_entity_render", || {
                 text(load_block_entity_render())
             });
-            let animate = named_scope(scope, "animate", || text(load_animate()));
-            let mobs = named_scope(scope, "mobs", || text(load_mobs()));
+            let animate = Step::spawn(scope, parallel, "animate", || text(load_animate()));
+            let mobs = Step::spawn(scope, parallel, "mobs", || text(load_mobs()));
             let transformers = text(load_transformers());
             (
-                items.join().unwrap(),
-                behaviours.join().unwrap(),
-                block_entity_render.join().unwrap(),
-                animate.join().unwrap(),
-                mobs.join().unwrap(),
+                items.join(),
+                behaviours.join(),
+                block_entity_render.join(),
+                animate.join(),
+                mobs.join(),
                 transformers,
             )
-        })
-    } else {
-        (
-            text(load_items()),
-            text(load_behaviours()),
-            text(load_block_entity_render()),
-            text(load_animate()),
-            text(load_mobs()),
-            text(load_transformers()),
-        )
-    };
+        });
     let (items, recipes, stations) = items?;
     let (animate, fog) = animate?;
     let (mob_types, mob_data) = mobs?;
@@ -21284,6 +21272,38 @@ fn build_renderer(
     shader_pack: bool,
     filtering: (i32, i32),
 ) -> Result<Renderer> {
+    build_renderer_with_seed(
+        window,
+        offscreen,
+        pack,
+        gui,
+        previous
+            .map(|r| r.reuse_seed_for_layers(pack.render.texture_layers))
+            .transpose()?,
+        prepared,
+        api,
+        translucent_batching,
+        wide_frame,
+        shader_pack,
+        filtering,
+    )
+}
+
+fn build_renderer_with_seed(
+    window: Arc<Window>,
+    offscreen: bool,
+    pack: &PackResources,
+    gui: &UiResources,
+    previous: Option<horizon_client::gfx::RendererSeed>,
+    prepared: Option<horizon_client::gfx::PreparedTextures>,
+    api: horizon_client::graphics::GraphicsApi,
+    translucent_batching: bool,
+    // HDR with Smooth Gradients (`Graphics::wide_frame`): a 16-bit frame where HDR output is
+    // offered (`Renderer::new`).
+    wide_frame: bool,
+    shader_pack: bool,
+    filtering: (i32, i32),
+) -> Result<Renderer> {
     let assets = &pack.render;
     let atlas = &gui.atlas;
     // The new renderer's atlas texture starts from `HudAtlas.pixels`, which
@@ -21297,7 +21317,7 @@ fn build_renderer(
     // Made here when the worker did not: the renderer's own fallback has no LabPBR maps.
     let prepared = Some(prepared.unwrap_or_else(|| prepare_renderer_textures(pack)));
     let atlas_pixels = atlas.pixels();
-    let mut renderer = pollster::block_on(Renderer::new(
+    let mut renderer = pollster::block_on(Renderer::new_with_seed(
         window,
         offscreen,
         &assets.pixels.get(),
@@ -21340,6 +21360,17 @@ fn build_renderer(
     Ok(renderer)
 }
 
+/// Drop obsolete atlases and targets before building the next startup renderer.
+/// The queue/driver retain any resources referenced by submitted commands.
+fn release_startup_renderer(
+    renderer: &mut Option<Renderer>,
+) -> Option<horizon_client::gfx::RendererSeed> {
+    renderer.take().map(|mut renderer| {
+        renderer.release_surface();
+        renderer.reuse_seed()
+    })
+}
+
 /// The loading screen's renderer: one atlas (the boot screen's until the
 /// pack's GUI atlas is ready) over one opaque white block-sprite layer, an
 /// empty border texture and the title panorama once the menu bundle is ready.
@@ -21348,7 +21379,7 @@ fn loading_renderer(
     offscreen: bool,
     atlas: Option<&horizon_client::hud::HudAtlas>,
     panorama: Option<&Arc<horizon_client::gfx::panorama::Faces>>,
-    previous: Option<&Renderer>,
+    previous: Option<horizon_client::gfx::RendererSeed>,
     api: horizon_client::graphics::GraphicsApi,
 ) -> Result<Renderer> {
     static FORCEFIELD: [u8; 4] = [0; 4];
@@ -21370,7 +21401,7 @@ fn loading_renderer(
     if let Some(atlas) = atlas {
         atlas.font.reset_cache();
     }
-    let mut renderer = pollster::block_on(Renderer::new(
+    let mut renderer = pollster::block_on(Renderer::new_with_seed(
         window,
         offscreen,
         &[255, 255, 255, 255],
@@ -21715,8 +21746,42 @@ fn run_event_loop(mut game: Game<'_>) -> Result<()> {
     Ok(())
 }
 
+fn performance_path() -> Option<PathBuf> {
+    if cfg!(target_os = "ios") {
+        Some(horizon_client::logging::game_home().join(local_performance::FILE))
+    } else {
+        std::env::var_os("HORIZON_LOCAL_PERFORMANCE_FILE").map(PathBuf::from)
+    }
+}
+
+fn performance_details(
+    renderer: &Renderer,
+    settings: &Settings,
+    phase: &str,
+    cap: u32,
+    pending: serde_json::Value,
+) -> serde_json::Value {
+    let gpu = renderer.performance_summary();
+    let memory = horizon_threads::process_memory::observations();
+    serde_json::json!({
+        "build": horizon_client::crash::version(), "phase":phase,
+        "backend":format!("{:?}", gpu.backend), "color_format":format!("{:?}", gpu.color_format),
+        "output_pixels":gpu.output_size, "world_pixels":gpu.world_size, "world_scale":gpu.world_scale,
+        "effective_cap_fps":cap, "thermal_status":horizon_client::platform::thermal_status(),
+        "os_low_power_mode":horizon_client::platform::low_power_mode(), "battery_mode":settings.horizon.battery,
+        "configured_workers":settings.horizon.worker_threads(), "pending":pending,
+        "resident_sections":gpu.resident_sections, "arena_capacity_bytes":gpu.arena_capacity_bytes,
+        "process_memory_bytes":{"resident":memory.resident,"footprint":memory.footprint,"available":memory.available},
+        "gpu_timing":{"supported":gpu.timing_supported,"requested":gpu.timing.requested,
+            "submitted":gpu.timing.submitted,"completed":gpu.timing.completed,
+            "invalid":gpu.timing.invalid,"busy":gpu.timing.busy}, "resolution_changes":gpu.resolution_changes
+    })
+}
+
 /// The loading screen's state while the worker loads the resources.
 struct Loading {
+    local_performance: local_performance::LocalPerformance,
+    redraw: loading_schedule::LoadingSchedule,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     /// The boot screen's atlas, until the pack's GUI atlas replaces it.
@@ -21761,6 +21826,8 @@ impl Loading {
             || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT)
     }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        self.redraw.reset();
+        self.local_performance.resume();
         if self.window.is_some() {
             self.suspended = false;
             if let (Some(window), Some(renderer)) = (&self.window, &mut self.renderer)
@@ -21916,9 +21983,7 @@ impl Loading {
             return;
         };
         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
-        if let Some(renderer) = &mut self.renderer {
-            renderer.release_surface();
-        }
+        let previous = release_startup_renderer(&mut self.renderer);
         let bundle = self.gui.as_ref().expect("the menu bundle was just set");
         let _step = startup::step("renderer.title_artwork");
         match loading_renderer(
@@ -21926,7 +21991,7 @@ impl Loading {
             offscreen,
             Some(&bundle.atlas),
             Some(&bundle.panorama),
-            self.renderer.as_ref(),
+            previous,
             self.settings.horizon.api,
         ) {
             Ok(r) => {
@@ -21937,6 +22002,7 @@ impl Loading {
         }
         // The title frame's wait starts once its renderer is built.
         self.ui_at = Some(Instant::now());
+        self.redraw.reset();
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if horizon_client::platform::exit_requested() {
@@ -21965,16 +22031,47 @@ impl Loading {
             return;
         }
         self.poll_menu_realms(event_loop);
-        if let Some(w) = &self.window {
+        let now = Instant::now();
+        let period = self.frame_period();
+        if self.redraw.request(now) {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
                 self.draw();
-            } else {
+            } else if let Some(w) = &self.window {
                 w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::Poll);
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            self.redraw
+                .wake_at(now, period.min(Duration::from_millis(33))),
+        ));
+    }
+    fn frame_period(&self) -> Duration {
+        let cap = horizon_client::platform::effective_fps_cap(
+            self.settings.max_fps,
+            self.settings.horizon.battery,
+            false,
+            true,
+        )
+        .clamp(
+            1,
+            if horizon_client::platform::is_mobile() {
+                30
+            } else {
+                60
+            },
+        );
+        Duration::from_secs_f64(1.0 / f64::from(cap))
     }
     fn draw(&mut self) {
+        if self.suspended || !self.redraw.begin_draw(Instant::now()) {
+            return;
+        }
+        let frame_started = Instant::now();
+        let cpu_started = self
+            .local_performance
+            .enabled()
+            .then(horizon_client::spans::thread_cpu)
+            .flatten();
         let Some(size) = self
             .renderer
             .as_ref()
@@ -21992,13 +22089,39 @@ impl Loading {
         );
         if let Some(renderer) = &mut self.renderer {
             match renderer.render(&frame) {
-                Ok(true) if self.gui.is_some() && self.menu.pending.is_none() => {
-                    self.title_drawn = true;
-                    self.menu.perf.title_shown()
+                Ok(true) => {
+                    if self.gui.is_some() && self.menu.pending.is_none() {
+                        self.title_drawn = true;
+                        self.menu.perf.title_shown();
+                    }
+                    let worked = cpu_started.and_then(|start| {
+                        horizon_client::spans::thread_cpu().and_then(|end| end.checked_sub(start))
+                    });
+                    self.local_performance.record_at(
+                        Instant::now(),
+                        worked,
+                        frame_started.elapsed().saturating_sub(renderer.last_wait),
+                        &renderer.gpu_times,
+                    );
                 }
-                Ok(_) => {}
+                Ok(false) => {}
                 Err(e) => log::warn!("Horizon: loading screen frame failed: {e}"),
             }
+            renderer.gpu_times.clear();
+        }
+        let local_now = Instant::now();
+        if self.local_performance.due(local_now)
+            && let Some(renderer) = &self.renderer
+        {
+            let details = performance_details(
+                renderer,
+                &self.settings,
+                "loading",
+                (1.0 / self.frame_period().as_secs_f64()).round() as u32,
+                serde_json::json!({"loader_stage":self.progress.value.load(Ordering::Relaxed),
+                    "loader_done":self.delivered}),
+            );
+            self.local_performance.publish(local_now, details);
         }
         if !self.shown {
             self.shown = true;
@@ -22008,6 +22131,7 @@ impl Loading {
                 self.started.elapsed().as_millis()
             );
         }
+        self.redraw.drawn(Instant::now(), self.frame_period());
     }
     fn finish(&mut self, loaded: Loaded) -> Result<Option<split::Split<'static>>> {
         let handoff_at = Instant::now();
@@ -22019,17 +22143,15 @@ impl Loading {
         let gui = self.gui.take().ok_or("missing menu bundle")?;
         let window = self.window.clone().ok_or("window closed")?;
         // Keep the loader's device and swap in the real textures in one step.
-        if let Some(renderer) = &mut self.renderer {
-            renderer.release_surface();
-        }
+        let previous = release_startup_renderer(&mut self.renderer);
         let renderer_at = Instant::now();
         let renderer = startup::time("renderer.world", || {
-            build_renderer(
+            build_renderer_with_seed(
                 window.clone(),
                 options.offscreen,
                 &loaded.pack,
                 &gui,
-                self.renderer.as_ref(),
+                previous,
                 loaded.renderer_cpu,
                 self.settings.horizon.api,
                 self.settings.horizon.translucent_batching,
@@ -22082,8 +22204,9 @@ impl Loading {
         game.fullscreen = self.fullscreen;
         game.panorama_rotation = self.panorama_rotation;
         self.menu.handoff(&mut game);
+        game.local_performance = std::mem::take(&mut self.local_performance);
         game.apply_settings();
-        game.previous = Instant::now();
+        game.previous.resume(Instant::now());
         // Minecraft.onGameLoadFinished: a start that made it this far is clean.
         game.settings.file.set(
             "startedCleanly",
@@ -22237,6 +22360,8 @@ fn run_loading(
         startup_menu::spawn_loader(&options, &settings, &vanilla_root, started, &progress)?;
     let menu = startup_menu::StartupMenu::new(&options, pack_error.as_deref())?;
     let loading = Loading {
+        local_performance: local_performance::LocalPerformance::new(performance_path(), started),
+        redraw: Default::default(),
         window: None,
         renderer: None,
         boot: horizon_client::hud::HudAtlas::boot(),
@@ -22405,11 +22530,14 @@ pub fn run_with() -> Result<()> {
             pack_error = Some(e.to_string());
             vanilla_root.clone()
         });
-    options.resources = mods::content_root(
-        &options.resources,
-        &early_settings.mods.enabled,
-        &options.dev_mods,
-    );
+    let budget = horizon_threads::loading::Budget::new(early_settings.horizon.worker_threads());
+    options.resources = budget.run(|| {
+        mods::content_root(
+            &options.resources,
+            &early_settings.mods.enabled,
+            &options.dev_mods,
+        )
+    });
     let loaded = load_resources(
         options.resources.clone(),
         launch_world(&options),
@@ -22626,7 +22754,8 @@ mod startup_cpu_tests {
             "minecraft:leash_knot#main": {}, "minecraft:wind_charge#main": {},
             "minecraft:shulker_bullet#main": {}, "minecraft:wither_skull#main": {},
             "minecraft:evoker_fangs#main": {}, "minecraft:standing_banner#main": {},
-            "minecraft:standing_banner#flag": {}
+            "minecraft:standing_banner#flag": {}, "minecraft:boat/oak#main": {},
+            "minecraft:chest_boat/oak#main": {}
         }"#,
         )
         .unwrap();
@@ -22637,30 +22766,68 @@ mod startup_cpu_tests {
         }]"#,
         )
         .unwrap();
+        let data = root.join("data/minecraft");
+        std::fs::create_dir_all(data.join("painting_variant")).unwrap();
+        std::fs::create_dir_all(data.join("tags/painting_variant")).unwrap();
+        std::fs::write(
+            data.join("painting_variant/test.json"),
+            r#"{"asset_id":"minecraft:test","width":4,"height":3}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            data.join("tags/painting_variant/placeable.json"),
+            r#"{"values":["minecraft:test"]}"#,
+        )
+        .unwrap();
+        let cache = Arc::new(std::sync::OnceLock::new());
+        let worker_cache = cache.clone();
         let worker_root = root.clone();
         let prepared = std::thread::spawn(move || {
-            GameCpuResources::load(&worker_root).map_err(|error| error.to_string())
+            GameCpuResources::cached(&worker_root, &worker_cache).map_err(|error| error.to_string())
         })
         .join()
         .unwrap()
         .unwrap();
         std::fs::remove_dir_all(&root).unwrap();
-        assert!(prepared.crystal_model.is_some());
-        assert!(prepared.cushion_model.is_some());
-        let models = &prepared.entity_models;
+        // An integrated server uses the same complete immutable generation,
+        // with no source files left to parse or bake. Its UI state is separate.
+        let mut server = GameCpuResources::cached(&root, &cache).unwrap();
+        assert!(Arc::ptr_eq(&prepared.assets, &server.assets));
+        assert!(server.assets.boat_models.has("oak", false));
+        assert!(server.assets.boat_models.has("oak", true));
+        let painting = server
+            .assets
+            .painting_variants
+            .get("minecraft:test")
+            .unwrap();
+        assert_eq!((painting.width, painting.height), (4, 3));
+        assert_eq!(
+            &*server.assets.painting_variants.placeable[0],
+            "minecraft:test"
+        );
+        server.creative_screen.selected = 42;
+        assert_ne!(
+            prepared.creative_screen.selected,
+            server.creative_screen.selected
+        );
+        assert!(prepared.assets.crystal_model.is_some());
+        assert!(prepared.assets.cushion_model.is_some());
+        let models = &prepared.assets.entity_models;
         assert!(models.leash_knot.is_some() && models.wind_charge.is_some());
         assert!(models.shulker_bullet.is_some() && models.wither_skull.is_some());
         assert!(models.evoker_fangs.is_some() && models.banner.is_some());
-        assert!(prepared.dragon_model.is_some());
-        assert!(prepared.arrow_model.is_some());
-        assert!(prepared.trident_model.is_some());
-        assert!(prepared.armor_stand_assets.main.is_some());
+        assert!(prepared.assets.dragon_model.is_some());
+        assert!(prepared.assets.arrow_model.is_some());
+        assert!(prepared.assets.trident_model.is_some());
+        assert!(prepared.assets.armor_stand_assets.main.is_some());
         assert_eq!(
             prepared.creative_screen.tabs[0].items[0].item.as_ref(),
             "minecraft:stone"
         );
         // No documents from the old generation remain available to reload.
         assert!(GameCpuResources::load(&root).is_err());
+        // A fresh pack generation cannot return the old generation's cache.
+        assert!(GameCpuResources::cached(&root, &std::sync::OnceLock::new()).is_err());
     }
 }
 
