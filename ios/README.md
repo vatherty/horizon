@@ -21,6 +21,7 @@ battery/memory savings have not been measured by this patch series.
 | `ios/src/lib.rs` | Rust staticlib entry, Documents home, logging, trace initialization and resource preflight |
 | `ios/app/main.swift` | Process entry, power/thermal monitor and handoff to winit |
 | `ios/app/LauncherAppDelegate.swift`, `LauncherViewController.swift` | Import/error phase and document picker |
+| `ios/app/LogViewController.swift` | The log screen: the end of `logs/latest.log`, wrapped and scrollable |
 | `ios/app/ResourceImporter.swift`, `ZipExtractor.swift` | Staged resource import with path validation |
 | `ios/app/Horizon-Bridging-Header.h` | Scalar C interface between Swift and Rust |
 | `ios/project.yml` | XcodeGen project; iOS 17+, unsigned build |
@@ -33,6 +34,15 @@ battery/memory savings have not been measured by this patch series.
 the main thread. It performs the shell setup normally done by `entry::main()`
 without exiting the process on a preflight error: return code 0 means ended,
 1 means error, 2 means resources missing. The importer reads `last-error.txt`.
+
+A second, much smaller entry point, `horizon_ios_resources_state(Documents
+path)`, answers where the prepared resources are (0 missing, 1 in
+`resources/`, 2 in the prepared folder, 3 at a `horizon-args.txt` override)
+using the same `resources_state` check a run makes. The Swift launcher asks
+with it instead of repeating the path rules in Swift — its own check once
+knew only `resources/`, so it disagreed with the game on phones whose
+resources live in the other two places. It is pure path checks: no setup, no
+game state, callable on any launch.
 
 The shell establishes Documents as the game home/current directory and reads
 `horizon-env.txt` before opt-in startup tracing. Logging directories exist before
@@ -67,6 +77,21 @@ preflight returns or startup fails before entering the application loop.
 On a missing-resource launch, Swift starts the importer/error launcher. Import
 then requires closing and reopening the app; the same process cannot transition
 from the importer's `UIApplicationMain` into winit. No scene manifest is used.
+
+This is also why there is no pre-launch screen on a launch where the game
+starts: a UIKit screen shown first would need `UIApplicationMain`, and winit
+0.30.13's `EventLoop::run` asserts `UIApplication.sharedApplication` is still
+nil — "`EventLoop` cannot be `run` after a call to `UIApplicationMain` on
+iOS" (`platform_impl/ios/event_loop.rs`) — so a process that showed a
+launcher first could never start the game at all, and iOS gives an app no
+way to restart its own process. The launcher phase is therefore the front
+door for setup and diagnosis on the launches where the game does not start:
+resource status and import, the last run's error, and a log screen
+(`LogViewController`) that shows the end of `logs/latest.log` wrapped to the
+screen's width — the game's own startup log screen draws its lines
+unwrapped, wider than the phone, so its lines cannot be read there. A true
+tap-to-launch screen would have to be drawn by the game itself, inside the
+game phase, not by this shell.
 
 Winit delivers active/inactive notifications to the Rust lifecycle. Suspension
 detaches native rendering without converting it to intentional offscreen rendering.
