@@ -35,7 +35,13 @@ fi
 rustup target list --installed 2>/dev/null | grep -q '^aarch64-apple-ios$' \
   || rustup target add aarch64-apple-ios
 
-cargo build --profile "$profile" --target aarch64-apple-ios --manifest-path "$here/Cargo.toml" "${cargo_args[@]}"
+# macOS /bin/bash is 3.2, where an empty "${arr[@]}" under `set -u` is an
+# "unbound variable" error, so the extra args only expand when present.
+if [ "${#cargo_args[@]}" -gt 0 ]; then
+    cargo build --profile "$profile" --target aarch64-apple-ios --manifest-path "$here/Cargo.toml" "${cargo_args[@]}"
+else
+    cargo build --profile "$profile" --target aarch64-apple-ios --manifest-path "$here/Cargo.toml"
+fi
 
 lib="$here/target/aarch64-apple-ios/$profile/libhorizon_ios.a"
 [ -f "$lib" ] || { echo "error: $lib was not built" >&2; exit 1; }
