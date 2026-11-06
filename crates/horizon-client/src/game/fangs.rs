@@ -48,7 +48,7 @@ impl Game<'_> {
 
     pub(super) fn insert_fangs(&mut self, id: u32, at: [f64; 3], yaw: f32, delay: i32, owner: u32) {
         if self.fangs.model.is_none() {
-            self.fangs.model = self.entity_models.evoker_fangs.clone();
+            self.fangs.model = self.model_assets.entity_models.evoker_fangs.clone();
         }
         self.fangs.list.push(Fangs {
             id,
