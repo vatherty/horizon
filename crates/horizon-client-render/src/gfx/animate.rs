@@ -737,7 +737,10 @@ mod tests {
     fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = crate::gfx::test_gpu::instance();
         let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        pollster::block_on(adapter.request_device(&Default::default())).ok()
+        let mut descriptor = wgpu::DeviceDescriptor::default();
+        descriptor.required_limits.max_texture_array_layers =
+            adapter.limits().max_texture_array_layers;
+        pollster::block_on(adapter.request_device(&descriptor)).ok()
     }
 
     /// Every layer's full mip chain, layer major.
@@ -805,23 +808,36 @@ mod tests {
         layers_match_the_cpu_chains_every_tick(false);
     }
 
+    #[test]
+    fn metal_boundary_layers_keep_animation_and_cache_order() {
+        layers_match_split(false, 512);
+    }
+
     fn layers_match_the_cpu_chains_every_tick(compute: bool) {
+        layers_match_split(compute, 2);
+    }
+
+    fn layers_match_split(compute: bool, split: u32) {
         let Some((device, queue)) = device() else {
             return;
         };
+        if device.limits().max_texture_array_layers < split {
+            eprintln!("Skipping {split}-layer animation test: adapter limit");
+            return;
+        }
         let size = 32;
         // Layers 1 and 3: 8-pixel sprites with and without interpolation;
         // layer 4: one at the array's size. Two layers per array.
         let clips = [
             (
-                1,
+                split - 1,
                 8,
                 r#"{"frametime":3,"interpolate":true,"frames":[0,2,1]}"#,
             ),
-            (3, 8, r#"{"frametime":2}"#),
-            (4, 32, r#"{"frametime":5,"interpolate":true}"#),
+            (split + 1, 8, r#"{"frametime":2}"#),
+            (split * 2, 32, r#"{"frametime":5,"interpolate":true}"#),
         ];
-        let mut mips = vec![Settings::default(); 6];
+        let mut mips = vec![Settings::default(); (split * 3) as usize];
         let animations: Vec<_> = clips
             .iter()
             .map(|&(layer, native, metadata)| {
@@ -832,7 +848,6 @@ mod tests {
                 crate::sprites::test_frames(layer, frames, metadata)
             })
             .collect();
-        let split = 2;
         let textures: Vec<_> = (0..3)
             .map(|_| {
                 device.create_texture(&wgpu::TextureDescriptor {
