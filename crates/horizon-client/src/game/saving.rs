@@ -223,7 +223,7 @@ impl Game<'_> {
                         self.finish_close_world()?;
                     }
                     self.clock.reset();
-                    self.previous = Instant::now();
+                    self.previous.resume(Instant::now());
                     Ok(false)
                 }
             }
