@@ -2565,7 +2565,7 @@ impl Game<'_> {
         // edge, scaled by the view scale.
         let range = (WIDTH + HEIGHT + WIDTH) / 3.0 * 64.0 * self.view_scale();
         for c in &self.carts {
-            let Some(model) = self.cart_models.models.get(&c.kind) else {
+            let Some(model) = self.model_assets.cart_models.models.get(&c.kind) else {
                 continue;
             };
             let lerp = self.remote_minecart_lerp(c.id, a);
