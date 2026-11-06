@@ -104,6 +104,38 @@ const COMPACT_MIN_FREE: u64 = 128 << 20;
 /// of its ranges in use halves it or is `PAGE_BYTES` smaller.
 const SHRINK_MIN_BYTES: u64 = 64 << 20;
 
+/// An off-by-default iOS experiment. Smaller pages/growth steps trade more
+/// draw batches and copies for lower unused capacity and earlier reclaim.
+#[derive(Clone, Copy)]
+struct MemoryPolicy {
+    small: bool,
+}
+impl MemoryPolicy {
+    fn from_environment() -> Self {
+        Self {
+            small: cfg!(target_os = "ios")
+                && std::env::var("HORIZON_IOS_SMALL_ARENAS").as_deref() == Ok("1"),
+        }
+    }
+    fn growth_bytes(self) -> u64 {
+        if self.small { 8 << 20 } else { PAGE_BYTES }
+    }
+    fn compact_free(self) -> u64 {
+        if self.small {
+            8 << 20
+        } else {
+            COMPACT_MIN_FREE
+        }
+    }
+    fn shrink_min(self) -> u64 {
+        if self.small {
+            8 << 20
+        } else {
+            SHRINK_MIN_BYTES
+        }
+    }
+}
+
 /// Terrain vertices in pages of at most `page_limit` vertices (devices cap
 /// buffer sizes): a section's vertices sit in one page.
 pub struct Arena {
@@ -111,6 +143,7 @@ pub struct Arena {
     stride: u64,
     page_limit: u64,
     initial_capacity: u64,
+    policy: MemoryPolicy,
     usage: wgpu::BufferUsages,
     /// A page being emptied (`Arena::close`): nothing is placed in it.
     closing: Option<u32>,
@@ -183,20 +216,48 @@ impl Arena {
         usage: wgpu::BufferUsages,
         page_bytes: u64,
     ) -> Self {
+        Self::with_policy(
+            device,
+            stride,
+            capacity,
+            usage,
+            page_bytes,
+            MemoryPolicy::from_environment(),
+        )
+    }
+    fn with_policy(
+        device: &wgpu::Device,
+        stride: u64,
+        capacity: u64,
+        usage: wgpu::BufferUsages,
+        page_bytes: u64,
+        policy: MemoryPolicy,
+    ) -> Self {
         // Pages of `page_bytes`, or less where the device's buffers (or the
         // storage bindings that read them whole) are smaller.
         let limits = device.limits();
+        let page_bytes = if policy.small {
+            page_bytes.min(32 << 20)
+        } else {
+            page_bytes
+        };
         let mut bytes = limits.max_buffer_size.min(page_bytes);
         if usage.contains(wgpu::BufferUsages::STORAGE) {
             bytes = bytes.min(limits.max_storage_buffer_binding_size);
         }
         let page_limit = (bytes / stride) / GRAIN * GRAIN;
+        let capacity = if policy.small {
+            capacity.min((4 << 20) / stride)
+        } else {
+            capacity
+        };
         let capacity = capacity.next_multiple_of(GRAIN).min(page_limit);
         Self {
             pages: Vec::new(),
             stride,
             page_limit,
             initial_capacity: capacity,
+            policy,
             usage,
             closing: None,
             spilled: false,
@@ -379,7 +440,7 @@ impl Arena {
     /// ranges can take. `None` when the arena is dense enough or already
     /// emptying a page.
     pub fn sparsest(&self) -> Option<u32> {
-        self.sparsest_from(COMPACT_MIN_FREE)
+        self.sparsest_from(self.policy.compact_free())
     }
     /// `sparsest` for an arena with at least `min_free` bytes in free ranges.
     fn sparsest_from(&self, min_free: u64) -> Option<u32> {
@@ -425,7 +486,7 @@ impl Arena {
         if self.closing.is_some() {
             return None;
         }
-        let saving = PAGE_BYTES / self.stride;
+        let saving = self.policy.growth_bytes() / self.stride;
         self.pages.iter().enumerate().find_map(|(i, p)| {
             let p = p.as_ref()?;
             let used = p.capacity - p.free_vertices();
@@ -435,7 +496,7 @@ impl Arena {
                 .next_multiple_of(GRAIN)
                 .min(self.page_limit);
             let smaller = 2 * capacity <= p.capacity || capacity + saving <= p.capacity;
-            (p.capacity * self.stride >= SHRINK_MIN_BYTES && used > 0 && smaller)
+            (p.capacity * self.stride >= self.policy.shrink_min() && used > 0 && smaller)
                 .then_some((i as u32, capacity))
         })
     }
@@ -521,7 +582,9 @@ impl Arena {
     /// by at most `PAGE_BYTES` past that size, so a large page is never left
     /// half empty (nor held twice during the copy) by hundreds of MiB.
     fn grown(&self, current: u64, len: u64) -> u64 {
-        let step = current.min(PAGE_BYTES / self.stride);
+        let step = current
+            .min(self.policy.growth_bytes() / self.stride)
+            .max(GRAIN);
         (current + step).max(current + len).min(self.page_limit)
     }
     /// Moves a page into a larger buffer; false (the page unchanged) when
@@ -1180,6 +1243,39 @@ mod tests {
         arena.trim();
         assert_eq!(arena.bytes(), 0);
         assert!(arena.pages.is_empty());
+    }
+
+    #[test]
+    fn mobile_policy_bounds_growth_preserves_uploads_and_reclaims_empty_pages() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let mut arena = Arena::with_policy(
+            &device,
+            4,
+            1 << 24,
+            wgpu::BufferUsages::VERTEX,
+            LARGE_PAGE_BYTES,
+            MemoryPolicy { small: true },
+        );
+        let (page, first) = alloc(&mut arena, &device, &queue, 1 << 20).unwrap();
+        queue.write_buffer(arena.buffer(page), first * 4, &23u32.to_le_bytes());
+        assert_eq!(arena.bytes(), 4 << 20);
+        let (_, second) = alloc(&mut arena, &device, &queue, GRAIN).unwrap();
+        assert_eq!(arena.bytes(), 8 << 20);
+        let (_, third) = alloc(&mut arena, &device, &queue, 2 << 20).unwrap();
+        assert_eq!(arena.bytes(), 16 << 20);
+        assert_eq!(read(&device, &queue, arena.buffer(page), first * 4), 23);
+        assert_eq!(arena.page_vertices() * 4, 32 << 20);
+        arena.release(page, first, 1 << 20);
+        arena.release(page, second, GRAIN);
+        arena.release(page, third, 2 << 20);
+        arena.trim();
+        assert_eq!(arena.bytes(), 0);
+        let (new_page, _) = alloc(&mut arena, &device, &queue, GRAIN).unwrap();
+        assert_eq!(new_page, page);
+        assert_eq!(arena.bytes(), 4 << 20);
     }
 
     /// Every arena's pages stay within its cap and the device's limits: the
