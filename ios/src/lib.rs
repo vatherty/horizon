@@ -15,11 +15,14 @@
 //! starts it when this function reports the resources missing, and the player
 //! relaunches after importing (ios/README.md, "Two phases, one process").
 //!
-//! This crate is the only place with `unsafe` code: the C entry point, the
-//! environment, and the `os_log` calls in `os_log.rs`.
+//! This crate is the only place with `unsafe` code: the C entry point and
+//! the environment setup below.
+//!
+//! Shell lifecycle lines go to the file log (`logs/latest.log`) like the
+//! game's: `os_log_with_type` is not a linkable symbol on iOS (it is absent
+//! from `libc` entirely; only `os_log_create` is exported), so there is no
+//! `os_log` sink in this crate.
 #![cfg(target_os = "ios")]
-
-mod os_log;
 
 /// The desktop binary's allocator (mimalloc), mirroring `src/main.rs`: this
 /// static library is linked into the Xcode app binary, so it is the whole app's
@@ -65,11 +68,10 @@ pub extern "C" fn horizon_ios_main(documents: *const c_char) -> c_int {
     // The Swift launcher starts the game at most once per process: a second run
     // would find the game's process-wide state in use.
     if STARTED.swap(true, Ordering::SeqCst) {
-        os_log::error("Horizon: horizon_ios_main ran twice in one process; leaving");
+        // No log sink exists yet this early; the exit code is the signal.
         return EXIT_ERROR;
     }
     let Some(documents) = cstr_to_path(documents) else {
-        os_log::error("Horizon: horizon_ios_main got no Documents folder");
         return EXIT_ERROR;
     };
     // Panics are caught here so that the launcher can show what happened instead
@@ -96,7 +98,7 @@ pub extern "C" fn horizon_ios_main(documents: *const c_char) -> c_int {
     logging::flush();
     let _ = fs::remove_file(documents.join(RUNNING_FILE));
     if let Some(message) = failure {
-        os_log::error(&format!("Horizon: {message}"));
+        log::error!("Horizon: {message}");
         let _ = fs::write(documents.join(ERROR_FILE), &message);
     }
     code
@@ -166,11 +168,6 @@ fn start(documents: &Path) -> Result<c_int, Failure> {
         crash::version(),
         documents.display()
     );
-    os_log::info(&format!(
-        "Horizon {} for iOS starting; game folder {}",
-        crash::version(),
-        documents.display()
-    ));
     crash::install(documents.to_path_buf(), "client");
     if !from_file.is_empty() {
         log::info!("Horizon: environment from {ENV_FILE}: {from_file:?}");
