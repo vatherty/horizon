@@ -10,6 +10,9 @@ description = "Scheduling hints for the game's threads and its allocator, and th
 mimalloc = { version = "0.1.52", default-features = false }
 libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended"] }
 
+[build-dependencies]
+cc = "1"
+
 [target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
 
