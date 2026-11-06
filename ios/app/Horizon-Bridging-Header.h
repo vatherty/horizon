@@ -19,4 +19,10 @@
 /// not on the phone yet.
 int horizon_ios_main(const char *documents);
 
+/// ProcessInfo thermal severity: 0 nominal, 1 fair, 2 serious, 3 critical.
+/// These setters only update atomics; notification delivery never waits for
+/// rendering, world ticks or disk I/O.
+void horizon_ios_set_thermal_state(int32_t state);
+void horizon_ios_set_low_power_mode(int32_t enabled);
+
 #endif
