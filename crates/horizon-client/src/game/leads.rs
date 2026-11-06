@@ -706,7 +706,7 @@ impl Game<'_> {
             }
         }
         // The knots: a 6 by 8 by 6 pixel block on the fence post.
-        let Some(model) = self.entity_models.leash_knot.as_ref() else {
+        let Some(model) = self.model_assets.entity_models.leash_knot.as_ref() else {
             return;
         };
         let Some(r) = atlas.sprites.get("entity/lead_knot/lead_knot").copied() else {
