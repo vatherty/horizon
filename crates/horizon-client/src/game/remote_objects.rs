@@ -91,7 +91,7 @@ impl Game<'_> {
             c.previous_pitch = pitch;
             self.carts.push(c);
         } else if let Some((wood, chest)) = super::boats::any_boat_wood(kind)
-            && self.boat_models.has(wood, chest)
+            && self.model_assets.boat_models.has(wood, chest)
         {
             let mut b = super::boats::Boat::new(id, Arc::from(wood), at, yaw);
             if chest {
@@ -161,7 +161,7 @@ impl Game<'_> {
     fn remote_painting_variant(&self, id: i32) -> Option<super::paintings::Variant> {
         let r = self.remote.as_ref()?;
         let name = r.registries.name("minecraft:painting_variant", id)?;
-        self.painting_variants.get(name).cloned()
+        self.model_assets.painting_variants.get(name).cloned()
     }
 
     /// `handleSetEntityData` for an object: what changes how it looks.
