@@ -1260,7 +1260,7 @@ impl Game<'_> {
     /// None when it aims at nothing (PASS) or the spot is taken (FAIL).
     pub(super) fn boat_to_place(&self, stack: &ItemStack) -> Option<Boat> {
         let (wood, chest) = any_boat_wood(&stack.item)?;
-        if !self.boat_models.has(wood, chest) {
+        if !self.model_assets.boat_models.has(wood, chest) {
             return None;
         }
         let hit = self.boat_item_hit()?;
@@ -1500,9 +1500,9 @@ impl Game<'_> {
             }
             let entity_start = out.len();
             let models = if b.chest {
-                &self.boat_models.chest_models
+                &self.model_assets.boat_models.chest_models
             } else {
-                &self.boat_models.models
+                &self.model_assets.boat_models.models
             };
             let Some(model) = models.get(&*b.wood) else {
                 continue;
@@ -1578,7 +1578,7 @@ impl Game<'_> {
             );
             // BoatRenderer.submitTypeAdditions: the water patch hides the water
             // inside the hull unless the boat is under water (RaftRenderer has none).
-            if let Some(patch) = self.boat_models.water_patch.as_ref()
+            if let Some(patch) = self.model_assets.boat_models.water_patch.as_ref()
                 && &*b.wood != "bamboo"
                 && !matches!(b.status, Status::UnderWater | Status::UnderFlowingWater)
             {
