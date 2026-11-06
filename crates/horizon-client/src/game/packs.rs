@@ -495,70 +495,73 @@ pub(super) fn stage_pack(
     japanese: bool,
     progress: &super::Progress,
 ) -> horizon_client::Result<StagedPack> {
-    let root = startup_root(vanilla_root, selected, server)?;
-    let root = super::mods::content_root(&root, mods_enabled, dev_mods);
-    progress.set(1);
-    // The world's models and sprites and the GUI atlas read the same root and nothing of
-    // each other: about a second each, side by side.
-    let mod_image = crate::game::mods::built_with_native_mods();
-    // The sound events, the GUI sprites' metadata and the language are read here too, not in
-    // the frame that applies the reload (about 20 ms of it).
-    let (render, atlas, panorama, (sounds, ui_metadata, language)) = std::thread::scope(|s| {
-        let atlas = s.spawn(|| {
-            HudAtlas::build_over_with_image(&root, vanilla_root, mod_image)
-                .map_err(|e| e.to_string())
-        });
-        let panorama = s.spawn(|| horizon_client::gfx::panorama::Faces::load(&root, vanilla_root));
-        let small = s.spawn(|| {
+    let budget = horizon_threads::loading::Budget::new(res.threads());
+    budget.run(|| {
+        let root = startup_root(vanilla_root, selected, server)?;
+        let root = super::mods::content_root(&root, mods_enabled, dev_mods);
+        progress.set(1);
+        // The world's models and sprites and the GUI atlas read the same root and nothing of
+        // each other: about a second each, side by side.
+        let mod_image = crate::game::mods::built_with_native_mods();
+        // The sound events, the GUI sprites' metadata and the language are read here too, not in
+        // the frame that applies the reload (about 20 ms of it).
+        let (render, atlas, panorama, (sounds, ui_metadata, language)) = std::thread::scope(|s| {
+            let atlas = super::Step::spawn(s, true, "reload-atlas", || {
+                HudAtlas::build_over_with_image(&root, vanilla_root, mod_image)
+                    .map_err(|e| e.to_string())
+            });
+            let panorama = super::Step::spawn(s, true, "reload-panorama", || {
+                horizon_client::gfx::panorama::Faces::load(&root, vanilla_root)
+            });
+            let small = super::Step::spawn(s, true, "reload-metadata", || {
+                (
+                    horizon_client::sound_events::SoundRegistry::load(&root),
+                    horizon_client::ui::read_metadata(&root),
+                    lang::Language::load(&[&root], &lang::code()),
+                )
+            });
             (
-                horizon_client::sound_events::SoundRegistry::load(&root),
-                horizon_client::ui::read_metadata(&root),
-                lang::Language::load(&[&root], &lang::code()),
+                assets.reload(&root),
+                atlas.join(),
+                panorama.join(),
+                small.join(),
             )
         });
-        (
-            assets.reload(&root),
-            atlas.join(),
-            panorama.join(),
-            small
-                .join()
-                .unwrap_or_else(|p| std::panic::resume_unwind(p)),
-        )
-    });
-    let render = Arc::new(render?);
-    let mut atlas = atlas.unwrap_or_else(|p| std::panic::resume_unwind(p))?;
-    atlas.font.uniform = force_unicode;
-    atlas.font.japanese = japanese;
-    let gui = UiResources {
-        atlas,
-        panorama: Arc::new(panorama.unwrap_or_else(|p| std::panic::resume_unwind(p))),
-    };
-    progress.set(2);
-    let pack = PackResources::load(
-        &root,
-        assets.clone(),
-        render,
-        res.facts(),
-        context.biomes.clone(),
-        context.light.clone(),
-    )?;
-    let textures = prepare_renderer_textures(&pack);
-    let cem = Arc::new(horizon_client::mobs::cem::CemModels::load(
-        &root,
-        res.mob_types(),
-    ));
-    let block_entity_shapes = res.block_entity_render().shapes_for(&root);
-    progress.set(3);
-    Ok(StagedPack {
-        root,
-        gui,
-        pack,
-        textures,
-        cem,
-        block_entity_shapes,
-        sounds,
-        ui_metadata,
-        language,
+        let render = Arc::new(render?);
+        let mut atlas = atlas?;
+        atlas.font.uniform = force_unicode;
+        atlas.font.japanese = japanese;
+        let gui = UiResources {
+            atlas,
+            panorama: Arc::new(panorama),
+        };
+        progress.set(2);
+        let pack = PackResources::load(
+            &root,
+            assets.clone(),
+            render,
+            res.facts(),
+            context.biomes.clone(),
+            context.light.clone(),
+        )?;
+        let textures = prepare_renderer_textures(&pack);
+        let cem = Arc::new(horizon_client::mobs::cem::CemModels::load(
+            &root,
+            res.mob_types(),
+        ));
+        let block_entity_shapes = res.block_entity_render().shapes_for(&root);
+        progress.set(3);
+        Ok(StagedPack {
+            root,
+            gui,
+            pack,
+            textures,
+            cem,
+            block_entity_shapes,
+            sounds,
+            ui_metadata,
+            language,
+        })
     })
 }
 
