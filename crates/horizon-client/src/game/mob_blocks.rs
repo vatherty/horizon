@@ -141,7 +141,7 @@ impl Game<'_> {
         if !horizon_client::mobs::raider::is_captain(mob) {
             return;
         }
-        let Some((pole, flag)) = &self.entity_models.banner else {
+        let Some((pole, flag)) = &self.model_assets.entity_models.banner else {
             return;
         };
         let Some(head) =
