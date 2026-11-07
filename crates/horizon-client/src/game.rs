@@ -21448,6 +21448,10 @@ fn spawn_loading_renderer(
     previous: Option<horizon_client::gfx::RendererSeed>,
     api: horizon_client::graphics::GraphicsApi,
 ) -> Receiver<std::result::Result<Renderer, String>> {
+    log::info!(
+        "checkpoint: spawn_loading_renderer entered (seeded: {})",
+        previous.is_some()
+    );
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
     static EMPTY_GLINT: [u8; 4] = [0; 4];
     let panorama = panorama
@@ -21478,6 +21482,7 @@ fn spawn_loading_renderer(
     std::thread::Builder::new()
         .name("loading-renderer".to_owned())
         .spawn(move || {
+            log::info!("checkpoint: loading-renderer worker: create_renderer starting");
             let built = create_renderer(|| {
                 pollster::block_on(Renderer::new_with_seed(
                     window,
@@ -21507,6 +21512,10 @@ fn spawn_loading_renderer(
                 renderer.hud.sprite_animations = animations;
                 renderer
             });
+            log::info!(
+                "checkpoint: loading-renderer worker: create_renderer returned (ok: {})",
+                built.is_ok()
+            );
             // The loop may have gone away with the build: a failed send is fine.
             let _ = sender.send(built.map_err(|e| e.to_string()));
         })
@@ -21937,6 +21946,7 @@ impl Loading {
                 || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT))
     }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        log::info!("checkpoint: Loading::resumed entered");
         self.redraw.reset();
         self.local_performance.resume();
         if self.window.is_some() {
@@ -21957,6 +21967,7 @@ impl Loading {
                     }
                 }
             }
+            log::info!("checkpoint: Loading::resumed window already exists (early return)");
             return;
         }
         // The Window constructor: created fullscreen when options.txt or --fullscreen says so.
@@ -21992,6 +22003,12 @@ impl Loading {
             }
         };
         drop(window_step);
+        let window_size = window.inner_size();
+        log::info!(
+            "checkpoint: Loading::resumed window created ({}x{})",
+            window_size.width,
+            window_size.height
+        );
         horizon_client::telemetry::note_display(&window);
         // The renderer takes seconds to build and winit's window sits white
         // until the first frame presents, so paint the boot screen on it and
@@ -22022,6 +22039,7 @@ impl Loading {
         // The build runs on a worker (`spawn_loading_renderer`) and
         // `poll_renderer` installs it when it lands; until then the window
         // sits unpainted, as it did while the inline build ran.
+        log::info!("checkpoint: Loading::resumed starting the boot renderer build");
         self.building = Some(PendingRenderer {
             receiver: spawn_loading_renderer(
                 window.clone(),
@@ -22071,11 +22089,13 @@ impl Loading {
     /// The menu bundle arrived: rebuild the loading screen with the real atlas
     /// and title panorama.
     fn set_ui(&mut self, gui: UiResources, root: PathBuf) {
+        log::info!("checkpoint: Loading::set_ui entered");
         // A renderer build is still running: the title build must start
         // from the landed renderer's seed, so hold the bundle until it
         // lands (`poll_renderer` runs it then). A bundle already held is
         // superseded — only the newest artwork is worth building.
         if self.building.is_some() {
+            log::info!("checkpoint: Loading::set_ui queued (a build is still running)");
             self.queued_ui = Some((gui, root));
             return;
         }
@@ -22083,6 +22103,7 @@ impl Loading {
     }
 
     fn set_ui_now(&mut self, gui: UiResources, root: PathBuf) {
+        log::info!("checkpoint: Loading::set_ui_now entered");
         log::info!(
             "Horizon: loading the title artwork after {} ms",
             self.started.elapsed().as_millis()
@@ -22101,6 +22122,7 @@ impl Loading {
         // The build runs on a worker (`spawn_loading_renderer`);
         // `poll_renderer` installs it, and the title frame's wait starts
         // when it lands.
+        log::info!("checkpoint: Loading::set_ui_now starting the title renderer build");
         self.building = Some(PendingRenderer {
             receiver: spawn_loading_renderer(
                 window,
@@ -22144,6 +22166,10 @@ impl Loading {
         drop(building.step);
         match result {
             Ok(renderer) => {
+                log::info!(
+                    "checkpoint: poll_renderer landed Ok ({})",
+                    if building.title { "title" } else { "boot" }
+                );
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
                 if building.title {
                     // The title frame's wait starts once its renderer is built.
@@ -22153,6 +22179,7 @@ impl Loading {
                 self.renderer = Some(renderer);
             }
             Err(message) => {
+                log::info!("checkpoint: poll_renderer landed Err: {message}");
                 self.error = Some(message.into());
                 return;
             }
@@ -22164,6 +22191,12 @@ impl Loading {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Temporary diagnostic: prove the loop is turning without filling
+        // the log — the first few ticks only.
+        static TICKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if TICKS.fetch_add(1, Ordering::Relaxed) < 3 {
+            log::info!("checkpoint: Loading::about_to_wait ticking");
+        }
         if horizon_client::platform::exit_requested() {
             event_loop.exit();
             return;
@@ -22296,6 +22329,7 @@ impl Loading {
         self.redraw.drawn(Instant::now(), self.frame_period());
     }
     fn finish(&mut self, loaded: Loaded) -> Result<Option<split::Split<'static>>> {
+        log::info!("checkpoint: Loading::finish entered");
         let handoff_at = Instant::now();
         let mut options = self.options.take().ok_or("loading already finished")?;
         options.resources = loaded.root.clone();
@@ -22307,6 +22341,7 @@ impl Loading {
         // Keep the loader's device and swap in the real textures in one step.
         let previous = release_startup_renderer(&mut self.renderer);
         let renderer_at = Instant::now();
+        log::info!("checkpoint: finish: building the world renderer");
         let renderer = startup::time("renderer.world", || {
             build_renderer_with_seed(
                 window.clone(),
@@ -22325,6 +22360,7 @@ impl Loading {
                 ),
             )
         })?;
+        log::info!("checkpoint: finish: world renderer built");
         log::info!(
             "Horizon: world renderer ready after {} ms",
             self.started.elapsed().as_millis()
@@ -22444,11 +22480,16 @@ impl ApplicationHandler for App {
                 } {
                     None => Step::Waiting,
                     Some(Err(e)) => Step::Failed(e.into()),
-                    Some(Ok(loaded)) => match loading.finish(loaded) {
-                        Ok(Some(game)) => Step::Ready(Box::new(game)),
-                        Ok(None) => Step::Done,
-                        Err(e) => Step::Failed(e),
-                    },
+                    Some(Ok(loaded)) => {
+                        log::info!(
+                            "checkpoint: App::about_to_wait handoff: calling Loading::finish"
+                        );
+                        match loading.finish(loaded) {
+                            Ok(Some(game)) => Step::Ready(Box::new(game)),
+                            Ok(None) => Step::Done,
+                            Err(e) => Step::Failed(e),
+                        }
+                    }
                 }
             }
         };
@@ -22517,6 +22558,7 @@ fn run_loading(
     pack_error: Option<String>,
     started: Instant,
 ) -> Result<()> {
+    log::info!("checkpoint: run_loading entered");
     let progress = Progress::new();
     let (receiver, loader) =
         startup_menu::spawn_loader(&options, &settings, &vanilla_root, started, &progress)?;
@@ -22553,6 +22595,7 @@ fn run_loading(
         boot_paint: None,
     };
     let mut app = App::Loading(Box::new(loading));
+    log::info!("checkpoint: run_loading starting the event loop");
     let result = horizon_client::winit_host::event_loop()?.run_app(&mut app);
     narrator::stop();
     match &mut app {
