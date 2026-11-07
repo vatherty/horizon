@@ -26,7 +26,17 @@ PlatformPowerMonitor.shared.start()
 // that decides where the game lives.
 let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
 
+// Put the last run's log at the top of Documents, where the Files app lists
+// it (LogExport.swift): a run that ended in a hard crash never returned here,
+// so its log is only exported on this next open, before the game phase's
+// logging rotates that `latest.log` away.
+exportGameLogToDocuments()
+
 let exitCode = documentsURL.path.withCString { horizon_ios_main($0) }
+
+// The run that just ended wrote its own log (and, on an error, maybe a crash
+// report): export those too.
+exportGameLogToDocuments()
 
 if exitCode != 0 {
     // 2: the prepared resources are not on the phone — the launcher offers the
