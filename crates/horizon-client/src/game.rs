@@ -21298,10 +21298,15 @@ where
 
 /// [`on_creation_stack`] for renderer creation: the game's error is a boxed
 /// trait object, which is not `Send`, so its message crosses the thread
-/// boundary and the box is rebuilt on this side.
-fn create_renderer<F>(work: F) -> Result<Renderer>
+/// boundary and the box is rebuilt on this side. Generic over what the
+/// creation builds: a caller that cannot hold the built value by value on
+/// its own stack (the startup handoff, with a ~49 KiB renderer) has the
+/// creation box it on the creation thread instead, so only the box crosses
+/// back.
+fn create_renderer<T, F>(work: F) -> Result<T>
 where
-    F: FnOnce() -> Result<Renderer> + Send,
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
 {
     on_creation_stack(move || work().map_err(|e| e.to_string())).map_err(Into::into)
 }
@@ -21336,6 +21341,7 @@ fn build_renderer(
         shader_pack,
         filtering,
     )
+    .map(|renderer| *renderer)
 }
 
 /// Kept out of its callers' frames: with the release profile's thin LTO
@@ -21345,7 +21351,10 @@ fn build_renderer(
 /// the giant values of the start (a ~128 KiB `Game`, a ~49 KiB
 /// `Renderer`) then transit one bounded frame at a time instead of being
 /// summed into a single reservation. The same seam is on `start_game`,
-/// `Game::new` and `Loading::finish_handoff`.
+/// `Game::new` and `Loading::finish_handoff`. The renderer is returned
+/// boxed — boxed on the creation thread, inside the creation — so the
+/// handoff holds only the box while `start_game` runs; `build_renderer`
+/// above unboxes for callers that hold a renderer by value as before.
 #[inline(never)]
 fn build_renderer_with_seed(
     window: Arc<Window>,
@@ -21361,7 +21370,7 @@ fn build_renderer_with_seed(
     wide_frame: bool,
     shader_pack: bool,
     filtering: (i32, i32),
-) -> Result<Renderer> {
+) -> Result<Box<Renderer>> {
     let assets = &pack.render;
     let atlas = &gui.atlas;
     // The new renderer's atlas texture starts from `HudAtlas.pixels`, which
@@ -21427,6 +21436,7 @@ fn build_renderer_with_seed(
             wide_frame,
             shader_pack,
         ))
+        .map(Box::new)
     })?;
     renderer.hud.sprite_animations = atlas
         .sprite_animations
@@ -21673,7 +21683,10 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
 /// The post-load setup once the resources are ready: `Game::new` and the
 /// options, packs, mods, control socket, benchmark and world selection the
 /// old `run` did after loading. `None` means a harness or dedicated run
-/// finished here instead.
+/// finished here instead. The game is returned boxed — boxed here, at the
+/// tail — because a caller on the event thread (the startup handoff)
+/// cannot hold a ~128 KiB `Game` by value in a frame that also does the
+/// rest of the start.
 #[allow(clippy::too_many_arguments)]
 /// Kept out of its callers' frames for the iOS main thread's stack: see
 /// `build_renderer_with_seed`.
@@ -21690,7 +21703,7 @@ fn start_game<'a>(
     rest_loader: Option<WorldRestLoader>,
     settings: Option<Settings>,
     prepared: Option<GameCpuResources>,
-) -> Result<Option<Game<'a>>> {
+) -> Result<Option<Box<Game<'a>>>> {
     let handoff = prepared.is_some();
     let mut settings = match settings {
         Some(settings) => settings,
@@ -21830,7 +21843,7 @@ fn start_game<'a>(
         game.wait_command_harness()?;
         return Ok(None);
     }
-    Ok(Some(game))
+    Ok(Some(Box::new(game)))
 }
 
 fn write_report(game: &Game<'_>) -> Result<()> {
@@ -22022,6 +22035,9 @@ impl Loading {
         // The Window constructor: created fullscreen when options.txt or --fullscreen says so.
         let fullscreen =
             self.settings.fullscreen || self.options.as_ref().is_some_and(|o| o.fullscreen);
+        // iOS ignores the persisted size entirely (see the attributes
+        // below): its window is the phone's one screen.
+        #[cfg(not(target_os = "ios"))]
         let size = self
             .options
             .as_ref()
@@ -22036,13 +22052,25 @@ impl Loading {
         let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
             attributes, "horizon", "horizon",
         );
+        // iOS: always borderless-fullscreen, with no fixed inner size. The
+        // persisted alternative is a trap: an unclean start persists a
+        // windowed mode, whose 1280x720 logical size the phone scales by
+        // its 3x factor into a 3840x2160 surface that never matches the
+        // panel (2532x1170 on the 13 Pro), and every later start inherits
+        // it. With no size requested, winit reports the real screen, and
+        // everything that reads the window — the surface's size, the GUI's
+        // auto-scale — follows from that.
+        #[cfg(target_os = "ios")]
+        let attributes =
+            attributes.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        #[cfg(not(target_os = "ios"))]
+        let attributes = attributes
+            .with_inner_size(winit::dpi::LogicalSize::new(size[0], size[1]))
+            .with_fullscreen(fullscreen.then_some(winit::window::Fullscreen::Borderless(None)));
         // `--offscreen` renders into a texture: its window would only show white.
         let window_step = startup::step("window.create");
         let window = match event_loop.create_window(
-            attributes
-                .with_inner_size(winit::dpi::LogicalSize::new(size[0], size[1]))
-                .with_fullscreen(fullscreen.then_some(winit::window::Fullscreen::Borderless(None)))
-                .with_visible(!self.options.as_ref().is_some_and(|o| o.offscreen)),
+            attributes.with_visible(!self.options.as_ref().is_some_and(|o| o.offscreen)),
         ) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -22355,7 +22383,7 @@ impl Loading {
         }
         self.redraw.drawn(Instant::now(), self.frame_period());
     }
-    fn finish(&mut self, loaded: Loaded) -> Result<Option<split::Split<'static>>> {
+    fn finish(&mut self, loaded: Loaded) -> Result<Option<Box<split::Split<'static>>>> {
         let handoff_at = Instant::now();
         let mut options = self.options.take().ok_or("loading already finished")?;
         options.resources = loaded.root.clone();
@@ -22374,19 +22402,28 @@ impl Loading {
     /// the `Game` it makes is not `Send` (its attribute maps and tick
     /// caches hold `Rc`s, its screens hold trait objects without `Send`
     /// bounds), so unlike renderer creation it cannot be built on another
-    /// thread and brought back. What keeps it inside the iOS main
-    /// thread's ~1 MB stack is that it is its own frame: with the release
+    /// thread and brought back. Keeping it inside the iOS main thread's
+    /// ~1 MB stack took two steps. First, frames: with the release
     /// profile's thin LTO and single codegen unit this work used to be
     /// inlined into `finish`, whose prologue then faulted on the stack
     /// guard before its first statement ran (a desktop main thread's
-    /// ~8 MB hides the fused frame). As separate frames — this one,
-    /// `build_renderer_with_seed`, `start_game`, `Game::new`, all
-    /// `#[inline(never)]` — the giant values of the start (a ~128 KiB
-    /// `Game`, a ~128 KiB `Split`, a ~49 KiB `Renderer`) transit one
-    /// bounded frame at a time instead of being summed into one
-    /// reservation. The renderer's heavy interior still runs on the
-    /// creation thread (`create_renderer`), and its surface is settled on
-    /// this thread inside `build_renderer_with_seed`, as before.
+    /// ~8 MB hides the fused frame), so this function and its heavy
+    /// callees — `build_renderer_with_seed`, `start_game`, `Game::new` —
+    /// are all `#[inline(never)]`. Second, boxing: separate frames still
+    /// left this frame's own peak too big, because a prologue reserves
+    /// for maximum liveness, not for what runs together — the built
+    /// `Renderer` (~49 KiB) stayed live across the `start_game` call and
+    /// the `Game` (~128 KiB) from its return to the `Split` built around
+    /// it, a reservation of some 180–310 KiB that faulted in this
+    /// function's prologue on the launches whose earlier frames left
+    /// less room. So the giant values never sit on this stack at all:
+    /// the renderer is boxed on the creation thread
+    /// (`build_renderer_with_seed`), `start_game` boxes the game at its
+    /// tail, and `Split::new_boxed` builds the split in its box from the
+    /// boxed game — this frame, and `finish`'s, hold pointers. The
+    /// renderer's heavy interior still runs on the creation thread
+    /// (`create_renderer`), and its surface is settled on this thread
+    /// inside `build_renderer_with_seed`, as before.
     #[inline(never)]
     fn finish_handoff(
         &mut self,
@@ -22396,7 +22433,7 @@ impl Loading {
         window: Arc<Window>,
         previous: Option<horizon_client::gfx::RendererSeed>,
         loaded: Loaded,
-    ) -> Result<Option<split::Split<'static>>> {
+    ) -> Result<Option<Box<split::Split<'static>>>> {
         let renderer_at = Instant::now();
         let renderer = startup::time("renderer.world", || {
             build_renderer_with_seed(
@@ -22452,7 +22489,7 @@ impl Loading {
         drop(game_step);
         let game_ms = game_at.elapsed().as_millis();
         game.window = Some(window);
-        game.renderer = Some(renderer);
+        game.renderer = Some(*renderer);
         game.world_renderer_ready = true;
         game.fullscreen = self.fullscreen;
         game.panorama_rotation = self.panorama_rotation;
@@ -22472,7 +22509,7 @@ impl Loading {
             renderer_ms,
             game_ms
         );
-        Ok(Some(split::Split::new(game)))
+        Ok(Some(split::Split::new_boxed(game)))
     }
 }
 
@@ -22536,7 +22573,7 @@ impl ApplicationHandler for App {
                     None => Step::Waiting,
                     Some(Err(e)) => Step::Failed(e.into()),
                     Some(Ok(loaded)) => match loading.finish(loaded) {
-                        Ok(Some(game)) => Step::Ready(Box::new(game)),
+                        Ok(Some(game)) => Step::Ready(game),
                         Ok(None) => Step::Done,
                         Err(e) => Step::Failed(e),
                     },
@@ -22836,7 +22873,7 @@ pub fn run_with() -> Result<()> {
             );
             game.settings.save(&Game::options_path());
         }
-        run_event_loop(game)?;
+        run_event_loop(*game)?;
     }
     Ok(())
 }
