@@ -12,6 +12,18 @@ use glam::{DMat4, DVec3, Mat4, Vec2};
 
 /// The least a world is scaled to when memory runs out.
 const MIN_SCALE: f32 = 0.25;
+
+/// `size` scaled down (never up) so its longest edge is at most `cap`, the
+/// aspect kept: a phone's 720p/1080p classes over the panel's own aspect, not
+/// a 16:9 stretch.
+fn capped_long_edge(size: [u32; 2], cap: u32) -> [u32; 2] {
+    let longest = size[0].max(size[1]);
+    if longest <= cap {
+        return size;
+    }
+    let by = cap as f32 / longest as f32;
+    size.map(|v| ((v as f32 * by).round() as u32).max(1))
+}
 /// The TAA history format: 8 bits would band as frames accumulate.
 const HISTORY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
@@ -63,6 +75,10 @@ pub struct Post {
     /// Output pixels per rendered pixel while TAA is on (1: native): the world renders
     /// this much smaller and TAA rebuilds it at the resolution scale's size.
     pub upscale: f32,
+    /// The longest edge the world may render at, in pixels (the platform's
+    /// phone cap, `platform::render_long_edge_cap`); `sizes` scales the output
+    /// down to it, aspect kept. `None`: no cap, the scale alone decides.
+    pub render_cap: Option<u32>,
     /// TAA runs this frame (`jitter`): not on the title screen or under a shader pack.
     taa_on: bool,
     target: Option<WorldTarget>,
@@ -241,6 +257,7 @@ impl Post {
             antialias: false,
             taa: false,
             upscale: 1.0,
+            render_cap: None,
             taa_on: false,
             target: None,
             taa_resources,
@@ -258,6 +275,10 @@ impl Post {
     /// The world's rendered size and the size it is shown at (TAA's history).
     fn sizes(&self, window: [u32; 2]) -> ([u32; 2], [u32; 2]) {
         let output = window.map(|v| ((v as f32 * self.scale).round() as u32).clamp(1, 8192));
+        let output = match self.render_cap {
+            Some(cap) => capped_long_edge(output, cap),
+            None => output,
+        };
         let upscale = if self.taa_on { self.upscale } else { 1.0 };
         (
             output.map(|v| ((v as f32 / upscale).round() as u32).max(1)),
@@ -587,6 +608,18 @@ fn halton(mut i: u32, base: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_cap_holds_the_long_edge_and_the_aspect() {
+        // An iPhone 13 Pro panel (2532x1170) at the two phone classes.
+        assert_eq!(capped_long_edge([2532, 1170], 1280), [1280, 591]);
+        assert_eq!(capped_long_edge([2532, 1170], 1920), [1920, 887]);
+        // Portrait caps the height the same way.
+        assert_eq!(capped_long_edge([1170, 2532], 1280), [591, 1280]);
+        // Already under the cap: untouched, never scaled up.
+        assert_eq!(capped_long_edge([1280, 720], 1920), [1280, 720]);
+        assert_eq!(capped_long_edge([800, 600], 1280), [800, 600]);
+    }
 
     #[test]
     fn reprojection_finds_where_a_block_was_last_frame() {
