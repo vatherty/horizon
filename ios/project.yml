@@ -20,6 +20,14 @@ targets:
       - path: app
     info:
       path: app/Info.plist
+      # XcodeGen regenerates the plist at this path from these properties
+      # (plus its defaults) rather than shipping the file as-is, so the
+      # Files-sharing keys must be declared here or they never reach the
+      # built app — the on-disk plist alone is not enough. They expose the
+      # Documents folder (game folder, logs, resources) in the Files app.
+      properties:
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.horizon.ios
