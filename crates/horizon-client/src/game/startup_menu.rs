@@ -1325,6 +1325,7 @@ mod tests {
             renderer: None,
             building: None,
             queued_ui: None,
+            handoff: None,
             boot: horizon_client::hud::HudAtlas::boot(),
             gui: None,
             settings: Settings::default(),
