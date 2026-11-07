@@ -263,6 +263,11 @@ static TABLE: LazyLock<Vec<Def>> = LazyLock::new(|| {
     for part in MODEL_PARTS {
         t.push(pb(&format!("modelPart_{part}"), true));
     }
+    // Horizon's touch controls (phones and tablets) have no vanilla
+    // counterpart; they sit after every vanilla key so nothing shifts.
+    t.push(u("touchSensitivity", 0.5));
+    t.push(u("touchButtonSize", 0.5));
+    t.push(b("touchWorldInteract", true));
     t
 });
 
