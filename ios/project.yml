@@ -28,6 +28,15 @@ targets:
       properties:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # The launch screen must be declared here too, for the same reason:
+        # LaunchScreen.storyboard is compiled into the bundle from the app
+        # sources, but without this key in the generated plist iOS treats
+        # the app as not built for modern screens and runs it at the legacy
+        # compatibility size — UIScreen reports 480x320pt, so the game's
+        # window (and with it the surface and GUI) comes up 1440x960 on a
+        # 2532x1170 panel, stretched to fit. With the key, UIScreen reports
+        # the real screen and the window matches the panel.
+        UILaunchStoryboardName: LaunchScreen
         # Landscape only, for the same reason as the Files keys above: the
         # generated plist's defaults include portrait, and with portrait
         # allowed the app starts in portrait and a turn to landscape hands
