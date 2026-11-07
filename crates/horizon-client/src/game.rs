@@ -19382,6 +19382,10 @@ fn load_forcefield(root: &std::path::Path) -> (u32, u32, Vec<u8>) {
 impl<'a> Game<'a> {
     /// A game with no world open, over the loaded resources: the window's,
     /// or an integrated server's on its own thread.
+    ///
+    /// Kept out of its callers' frames for the iOS main thread's stack:
+    /// see `build_renderer_with_seed`.
+    #[inline(never)]
     fn new(
         res: &'a Arc<Resources>,
         pack: PackResources,
@@ -21334,6 +21338,15 @@ fn build_renderer(
     )
 }
 
+/// Kept out of its callers' frames: with the release profile's thin LTO
+/// and single codegen unit, inlining this build (and the handoff's other
+/// heavy steps) into `Loading::finish` fused them into one frame that
+/// overflowed the iOS main thread's ~1 MB stack in `finish`'s prologue —
+/// the giant values of the start (a ~128 KiB `Game`, a ~49 KiB
+/// `Renderer`) then transit one bounded frame at a time instead of being
+/// summed into a single reservation. The same seam is on `start_game`,
+/// `Game::new` and `Loading::finish_handoff`.
+#[inline(never)]
 fn build_renderer_with_seed(
     window: Arc<Window>,
     offscreen: bool,
@@ -21662,6 +21675,9 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
 /// old `run` did after loading. `None` means a harness or dedicated run
 /// finished here instead.
 #[allow(clippy::too_many_arguments)]
+/// Kept out of its callers' frames for the iOS main thread's stack: see
+/// `build_renderer_with_seed`.
+#[inline(never)]
 fn start_game<'a>(
     res: &'a Arc<Resources>,
     pack: PackResources,
@@ -22350,6 +22366,37 @@ impl Loading {
         let window = self.window.clone().ok_or("window closed")?;
         // Keep the loader's device and swap in the real textures in one step.
         let previous = release_startup_renderer(&mut self.renderer);
+        self.finish_handoff(handoff_at, options, gui, window, previous, loaded)
+    }
+
+    /// The handoff itself: build the world renderer, construct the game,
+    /// hand the menu's state over. It runs on the event loop's thread —
+    /// the `Game` it makes is not `Send` (its attribute maps and tick
+    /// caches hold `Rc`s, its screens hold trait objects without `Send`
+    /// bounds), so unlike renderer creation it cannot be built on another
+    /// thread and brought back. What keeps it inside the iOS main
+    /// thread's ~1 MB stack is that it is its own frame: with the release
+    /// profile's thin LTO and single codegen unit this work used to be
+    /// inlined into `finish`, whose prologue then faulted on the stack
+    /// guard before its first statement ran (a desktop main thread's
+    /// ~8 MB hides the fused frame). As separate frames — this one,
+    /// `build_renderer_with_seed`, `start_game`, `Game::new`, all
+    /// `#[inline(never)]` — the giant values of the start (a ~128 KiB
+    /// `Game`, a ~128 KiB `Split`, a ~49 KiB `Renderer`) transit one
+    /// bounded frame at a time instead of being summed into one
+    /// reservation. The renderer's heavy interior still runs on the
+    /// creation thread (`create_renderer`), and its surface is settled on
+    /// this thread inside `build_renderer_with_seed`, as before.
+    #[inline(never)]
+    fn finish_handoff(
+        &mut self,
+        handoff_at: Instant,
+        options: Options,
+        gui: UiResources,
+        window: Arc<Window>,
+        previous: Option<horizon_client::gfx::RendererSeed>,
+        loaded: Loaded,
+    ) -> Result<Option<split::Split<'static>>> {
         let renderer_at = Instant::now();
         let renderer = startup::time("renderer.world", || {
             build_renderer_with_seed(
