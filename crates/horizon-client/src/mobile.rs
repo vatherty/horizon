@@ -21,8 +21,9 @@
 //! | clouds | fancy | fast | fill rate |
 //! | menu blur | 5 | 2 | a full-screen blur is expensive on a mobile GPU |
 //! | auto jump | off | on | there is no key to hold for a jump on a touch screen |
-//! | battery mode | off | on | 60 FPS in a world, 30 in menus, half the worker threads |
-//! | world resolution | 100% | 75% | roughly 56% of native world pixels; HUD stays native |
+//! | fullscreen | off | on | a phone's window fills the screen; asking for the desktop's windowed size instead made the surface a size the panel is not (3840x2100 on a 2532x1170 phone), so the GPU rendered pixels that cannot exist |
+//! | battery mode | off | on | 60 FPS in a world, 30 in menus, half the worker threads — and on iOS it caps the world's render at 720p class (1280 px long edge) |
+//! | world resolution | 100% | 75% | roughly 56% of native world pixels; HUD stays native. On iOS the render is capped at 1080p class (1920 px) even at 100%: 720p is the norm there, 1080p the push |
 //!
 //! Resolution scaling adds an intermediate target and a copy. It is not a
 //! guaranteed FPS or RAM improvement. The texture budget limits top-mip color
@@ -45,6 +46,7 @@ pub fn options() -> OptionsFile {
     f.set("entityShadows", V::Bool(false));
     f.set("menuBackgroundBlurriness", V::Int(2));
     f.set("autoJump", V::Bool(true));
+    f.set("fullscreen", V::Bool(true));
     f.set_name("renderClouds", "fast");
     f
 }
@@ -95,6 +97,8 @@ mod tests {
         assert_eq!(phone.particles, 1);
         assert!(!phone.entity_shadows);
         assert!(phone.auto_jump);
+        assert!(phone.fullscreen);
+        assert!(!desktop.fullscreen);
         assert_eq!(phone.clouds, "fast");
         assert!((phone.entity_distance - 0.75).abs() < 1e-6);
         assert_eq!(phone.menu_blur, 2);
