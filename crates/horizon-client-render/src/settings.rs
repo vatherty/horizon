@@ -100,6 +100,15 @@ pub struct Settings {
     pub simulation_distance: i32,
     /// 0..1, vanilla default 0.5.
     pub sensitivity: f32,
+    /// Touch look sensitivity as stored (`touchSensitivity`), 0..1: the
+    /// multiplier on the touch layout's look gain is twice this, so the
+    /// default 0.5 keeps the layout's own gain.
+    pub touch_sensitivity: f32,
+    /// Touch button size as stored (`touchButtonSize`), 0..1: the layout's
+    /// button fraction is scaled by 0.5 + this (its own min/max still clamp).
+    pub touch_button_size: f32,
+    /// Tap the world to use, hold it to break (`touchWorldInteract`).
+    pub touch_world_interact: bool,
     /// 0..1 (soundCategory_master).
     pub master_volume: f32,
     /// Volumes of every other sound source, indexed like SOUND_SOURCES.
@@ -212,6 +221,9 @@ impl Default for Settings {
             render_distance: 12,
             simulation_distance: 12,
             sensitivity: 0.5,
+            touch_sensitivity: 0.5,
+            touch_button_size: 0.5,
+            touch_world_interact: true,
             master_volume: 1.0,
             volumes: [1.0; 11],
             sound_device: String::new(),
@@ -429,6 +441,9 @@ impl Settings {
             render_distance: f.int("renderDistance"),
             simulation_distance: f.int("simulationDistance"),
             sensitivity: f.double("mouseSensitivity") as f32,
+            touch_sensitivity: f.double("touchSensitivity") as f32,
+            touch_button_size: f.double("touchButtonSize") as f32,
+            touch_world_interact: f.bool("touchWorldInteract"),
             master_volume: volumes[0],
             volumes,
             sound_device: f.string("soundDevice"),
@@ -526,6 +541,9 @@ impl Settings {
         put_i(&mut f, "renderDistance", self.render_distance);
         put_i(&mut f, "simulationDistance", self.simulation_distance);
         put_f(&mut f, "mouseSensitivity", self.sensitivity);
+        put_f(&mut f, "touchSensitivity", self.touch_sensitivity);
+        put_f(&mut f, "touchButtonSize", self.touch_button_size);
+        put_b(&mut f, "touchWorldInteract", self.touch_world_interact);
         for (i, source) in SOUND_SOURCES.iter().enumerate() {
             let v = if i == 0 {
                 self.master_volume
@@ -660,6 +678,16 @@ impl Settings {
             self.extras.save(dir);
             self.mods.save(&crate::logging::shared_dir(dir));
         }
+    }
+    /// The multiplier the touch options give the touch layout's look gain
+    /// (1.0 at the default, so the layout's own gain rules).
+    pub fn touch_look_multiplier(&self) -> f32 {
+        2.0 * self.touch_sensitivity
+    }
+    /// The scale the touch options give the touch layout's button fraction
+    /// (1.0 at the default; the layout's min/max clamp still applies).
+    pub fn touch_button_scale(&self) -> f32 {
+        0.5 + self.touch_button_size
     }
     /// Volume of a sound source (master excluded).
     pub fn volume(&self, source: &str) -> f32 {
@@ -816,6 +844,10 @@ pub enum Opt {
     PadLookDeadzone,
     PadGlyphs,
     PadKeyboard,
+    /// Horizon's touch settings (`touch*` in options.txt).
+    TouchSensitivity,
+    TouchButtonSize,
+    TouchWorldInteract,
     /// `options.modelPart.*`: one skin layer (index into `options_file::MODEL_PARTS`).
     ModelPart(usize),
     /// 3D skin layers: the player's outer layer as extruded slabs.
@@ -990,5 +1022,26 @@ mod tests {
         assert_eq!(again.sound_device, "Headphones");
         let empty = Settings::parse("");
         assert_eq!(empty.sound_device, "");
+    }
+    #[test]
+    fn touch_options_round_trip_with_defaults() {
+        let d = Settings::parse("");
+        assert_eq!(d.touch_sensitivity, 0.5);
+        assert_eq!(d.touch_button_size, 0.5);
+        assert!(d.touch_world_interact);
+        assert_eq!(d.touch_look_multiplier(), 1.0);
+        assert_eq!(d.touch_button_scale(), 1.0);
+        let s = Settings::parse(
+            "touchSensitivity:0.75\ntouchButtonSize:0.25\ntouchWorldInteract:false\n",
+        );
+        assert_eq!(s.touch_sensitivity, 0.75);
+        assert_eq!(s.touch_button_size, 0.25);
+        assert!(!s.touch_world_interact);
+        assert_eq!(s.touch_look_multiplier(), 1.5);
+        assert_eq!(s.touch_button_scale(), 0.75);
+        let again = Settings::parse(&s.serialize());
+        assert_eq!(again.touch_sensitivity, 0.75);
+        assert_eq!(again.touch_button_size, 0.25);
+        assert!(!again.touch_world_interact);
     }
 }
