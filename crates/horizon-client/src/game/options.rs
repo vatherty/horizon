@@ -540,6 +540,11 @@ impl Game<'_> {
                 s.horizon.taa,
                 s.horizon.upscaling.ratio(),
             );
+            // A phone renders the world at 720p class under battery mode,
+            // 1080p at most without it; other platforms get no cap.
+            r.set_render_cap(horizon_client::platform::render_long_edge_cap(
+                s.horizon.battery,
+            ));
             r.set_frame_generation(
                 s.horizon.frame_generation != horizon_client::graphics::FrameGeneration::Off,
             );
