@@ -144,6 +144,14 @@ pub(crate) const MOUSE_OPTIONS: &[Opt] = &[
     Opt::AllowCursorChanges,
 ];
 
+/// Horizon's touch options, under the mouse settings on their own page
+/// section (phones and tablets; the desktop shows them too, harmlessly).
+pub(crate) const TOUCH_OPTIONS: &[Opt] = &[
+    Opt::TouchSensitivity,
+    Opt::TouchButtonSize,
+    Opt::TouchWorldInteract,
+];
+
 impl Opt {
     /// Keep controls visible while their underlying systems are still missing.
     pub(crate) fn available(self) -> bool {
@@ -307,6 +315,9 @@ impl Opt {
             Opt::PadLookDeadzone => "horizon.options.look_deadzone",
             Opt::PadGlyphs => "horizon.options.button_glyphs",
             Opt::PadKeyboard => "horizon.options.on_screen_keyboard",
+            Opt::TouchSensitivity => "horizon.options.touch_sensitivity",
+            Opt::TouchButtonSize => "horizon.options.touch_button_size",
+            Opt::TouchWorldInteract => "horizon.options.touch_world_interact",
             Opt::ModelPart(i) => [
                 "options.modelPart.cape",
                 "options.modelPart.jacket",
@@ -385,6 +396,8 @@ impl Opt {
             Opt::PadRepeatInterval => unit(s.controller.repeat_interval, 0.03, 0.3),
             Opt::PadMoveDeadzone => unit(s.controller.move_deadzone, 0.0, 0.5),
             Opt::PadLookDeadzone => unit(s.controller.look_deadzone, 0.0, 0.5),
+            Opt::TouchSensitivity => Kind::Slider(s.touch_sensitivity),
+            Opt::TouchButtonSize => Kind::Slider(s.touch_button_size),
             Opt::SprintWindow => unit(s.sprint_window as f32, 0.0, 10.0),
             _ => Kind::Cycle,
         }
@@ -641,6 +654,8 @@ impl Opt {
                 ),
             ),
             Opt::PadLookSensitivity => percent(c, 2.0 * s.controller.look_sensitivity),
+            Opt::TouchSensitivity => percent(c, s.touch_look_multiplier()),
+            Opt::TouchButtonSize => percent(c, s.touch_button_scale()),
             Opt::PadPointerSpeed => percent(c, s.controller.pointer_speed),
             Opt::PadScrollSpeed => percent(c, s.controller.scroll_speed / 12.0),
             Opt::PadRepeatDelay | Opt::PadRepeatInterval => generic(
@@ -824,6 +839,7 @@ impl Opt {
             Opt::ForceUnicode => on_off(s.force_unicode),
             Opt::JapaneseGlyphs => on_off(s.japanese_glyphs),
             Opt::PadEnabled => on_off(s.controller.enabled),
+            Opt::TouchWorldInteract => on_off(s.touch_world_interact),
             Opt::PadVibration => on_off(s.controller.vibration),
             Opt::PadAdaptiveTriggers => on_off(s.controller.adaptive_triggers),
             Opt::PadInvertX => on_off(s.controller.invert_x),
@@ -921,6 +937,8 @@ impl Opt {
             Opt::PadRepeatInterval => s.controller.repeat_interval = step(30.0, 300.0) / 1000.0,
             Opt::PadMoveDeadzone => s.controller.move_deadzone = step(0.0, 50.0) / 100.0,
             Opt::PadLookDeadzone => s.controller.look_deadzone = step(0.0, 50.0) / 100.0,
+            Opt::TouchSensitivity => s.touch_sensitivity = v,
+            Opt::TouchButtonSize => s.touch_button_size = v,
             Opt::SprintWindow => s.sprint_window = step(0.0, 10.0) as i32,
             _ => {}
         }
@@ -1120,6 +1138,7 @@ impl Opt {
             Opt::ForceUnicode => s.force_unicode = !s.force_unicode,
             Opt::JapaneseGlyphs => s.japanese_glyphs = !s.japanese_glyphs,
             Opt::PadEnabled => s.controller.enabled = !s.controller.enabled,
+            Opt::TouchWorldInteract => s.touch_world_interact = !s.touch_world_interact,
             Opt::PadVibration => s.controller.vibration = !s.controller.vibration,
             Opt::PadAdaptiveTriggers => {
                 s.controller.adaptive_triggers = !s.controller.adaptive_triggers
@@ -3013,7 +3032,12 @@ impl OptionsUi {
                 ));
                 self.filter_option_rows(rows)
             }
-            Page::Mouse => pairs(MOUSE_OPTIONS),
+            Page::Mouse => {
+                let mut rows = pairs(MOUSE_OPTIONS);
+                rows.push(Row::Header("horizon.options.touch"));
+                rows.extend(pairs(TOUCH_OPTIONS));
+                rows
+            }
             Page::Chat => pairs(&[
                 Opt::ChatVisibility,
                 Opt::ChatColors,
@@ -5672,6 +5696,9 @@ mod tests {
                 }
             }
         }
+        // Vanilla's mouse options first, in Java 26.3's order; Horizon's
+        // touch section follows under its own header (not a Pair row, so
+        // it does not appear here beyond its options).
         assert_eq!(
             options,
             vec![
@@ -5681,6 +5708,9 @@ mod tests {
                 Opt::InvertX,
                 Opt::InvertY,
                 Opt::AllowCursorChanges,
+                Opt::TouchSensitivity,
+                Opt::TouchButtonSize,
+                Opt::TouchWorldInteract,
             ]
         );
     }
