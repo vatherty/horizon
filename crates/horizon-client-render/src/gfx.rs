@@ -2208,6 +2208,7 @@ async fn open_backend(
         Some(window),
         allow_nonconformant,
     ));
+    log::info!("checkpoint: open_backend instance created");
     let surface = if offscreen {
         None
     } else {
@@ -2216,6 +2217,7 @@ async fn open_backend(
             Err(e) => return Err(NoDevice::Failed(format!("{name} surface: {e}"))),
         }
     };
+    log::info!("checkpoint: open_backend surface ready (offscreen: {offscreen})");
     let adapter = match instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -2228,6 +2230,10 @@ async fn open_backend(
         Ok(adapter) => adapter,
         Err(e) => return Err(NoDevice::NoAdapter(format!("{name}: {e}"))),
     };
+    log::info!(
+        "checkpoint: open_backend adapter resolved: {}",
+        adapter.get_info().name
+    );
     // NoAdapter, so `open_with_retry` asks again: with the non-conformant
     // adapters shown, wgpu ranks a real GPU (hasvk on Ivy Bridge or Haswell)
     // above a software one. The second try's error is final either way.
@@ -2319,6 +2325,10 @@ async fn open_backend(
         }
     }
     let opened = opened.expect("at least one device attempt");
+    log::info!(
+        "checkpoint: open_backend device resolved (ok: {})",
+        opened.is_ok()
+    );
     match opened {
         Ok((device, queue)) => {
             let device_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2628,6 +2638,10 @@ impl Renderer {
         wide_frame: bool,
         shader_pack: bool,
     ) -> Result<Self> {
+        log::info!(
+            "checkpoint: new_with_seed entered (previous: {})",
+            previous.is_some()
+        );
         let reused = previous.is_some();
         let present_mode = previous.as_ref().map(|r| r.present_mode);
         let reuse = previous
@@ -2669,6 +2683,7 @@ impl Renderer {
                 open_device(&window, offscreen, api, layers).await?
             }
         };
+        log::info!("checkpoint: new_with_seed device opened");
         // Computed once: the sprite arrays, the shaders' constants and the
         // shader pack atlas all cut the sprites by it.
         let split = check_layers(&adapter, layers)?;
@@ -2714,6 +2729,7 @@ impl Renderer {
                 ));
             }
             surface.configure(&device, &config);
+            log::info!("checkpoint: new_with_seed surface configured");
             let hdr_output = hdr::output(&caps);
             crate::graphics::offer_hdr(hdr_output.is_some());
             if !reused {
@@ -4689,6 +4705,7 @@ impl Renderer {
             ));
         }
         let world_primitives = world_primitives::WorldPrimitives::new(&device, frame_format);
+        log::info!("checkpoint: new_with_seed returning the renderer");
         Ok(Self {
             display: DisplayWatch::default(),
             display_fresh: false,
