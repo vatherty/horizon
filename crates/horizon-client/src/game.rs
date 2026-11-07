@@ -8121,6 +8121,11 @@ impl Game<'_> {
         let key = [KeyCode::ShiftLeft, KeyCode::ControlLeft][slot];
         if self.toggles.is_down(slot) {
             self.keys.insert(key);
+        } else if self.touch_holds_action(["key.sneak", "key.sprint"][slot]) {
+            // Keyboard modifier recovery cannot release a separate touch hold
+            // (including flight descent, which bypasses toggle crouch).
+            self.keys.release(&key, Source::Keyboard);
+            self.keys.release(&key, Source::Pad);
         } else {
             self.keys.remove(&key);
         }
@@ -8169,7 +8174,7 @@ impl Game<'_> {
             // A controller's stick click acts as the key without setting the modifier: it is held
             // while the pad holds it (or its release waits for a tick), not when the keyboard says.
             let pad = self.pad.holds_action(&self.settings.controller, mapping);
-            if !held && !pad {
+            if !held && !pad && !self.touch_holds_action(mapping) {
                 self.toggles.0[slot].set_down(false, needs_toggle);
                 self.sync_toggle(slot);
             }
@@ -8867,6 +8872,10 @@ impl Game<'_> {
         // the sleep overlay, debug screen and open screens still draw.
         let spectator = self.spectator();
         let (wi, hi) = (w as i32, h as i32);
+        // Touch controls and the bottom HUD share one safe-area baseline, so
+        // the home indicator cannot cover either an item or its tap target.
+        // Keep the full screen height for the crosshair and camera overlays.
+        let bottom_hi = (h - self.touch_hud_bottom_inset(&batch)).floor() as i32;
         let show_hud = !self.ui.hide_gui;
         // max(Hud.leftHeight, Hud.rightHeight) after the bars: the item name and
         // the action bar sit above it.
@@ -8902,7 +8911,10 @@ impl Game<'_> {
             }
             self.gui_layer("minecraft:hotbar", &mut batch, |g, batch| {
                 if spectator {
+                    let full_height = batch.height;
+                    batch.height = bottom_hi as f32;
                     g.draw_spectator_hotbar(batch);
+                    batch.height = full_height;
                 } else {
                     let partial = g.clock.fraction() as f32;
                     let inputs = hud_layout::HotbarInputs {
@@ -8917,7 +8929,7 @@ impl Game<'_> {
                         offhand_pop: (f32::from(g.hotbar_pop[9]) - partial).max(0.0),
                         attack: (indicator == 2).then_some(strength),
                     };
-                    let draws = hud_layout::hotbar(wi, hi, &inputs);
+                    let draws = hud_layout::hotbar(wi, bottom_hi, &inputs);
                     hud_layout::paint(batch, &g.gui.atlas, &draws);
                     for d in &draws {
                         if let hud_layout::GuiDraw::Item { slot, x, y, .. } = *d {
@@ -8961,7 +8973,7 @@ impl Game<'_> {
             let vehicle_hearts = if spectator {
                 0
             } else {
-                self.draw_mount_hud(&mut batch, wi, hi)
+                self.draw_mount_hud(&mut batch, wi, bottom_hi)
             };
             // Without the survival bars only the mount's hearts raise it.
             bar_height = 39 + 10 * ((vehicle_hearts + 9) / 10);
@@ -8970,10 +8982,11 @@ impl Game<'_> {
             // number that a survival player always has.
             self.gui_layer("minecraft:contextual_info_bar", &mut batch, |g, batch| {
                 if contextual == ContextualBar::JumpableVehicle {
-                    g.draw_jump_bar(batch, wi, hi);
+                    g.draw_jump_bar(batch, wi, bottom_hi);
                 }
                 if contextual == ContextualBar::Locator {
-                    let (sprite, [x, y, w, h]) = horizon_client::locator_bar::background(wi, hi);
+                    let (sprite, [x, y, w, h]) =
+                        horizon_client::locator_bar::background(wi, bottom_hi);
                     horizon_client::ui::nine_slice(
                         batch,
                         &g.gui.atlas,
@@ -8990,7 +9003,7 @@ impl Game<'_> {
                     let width = |s: &str| HudBatch::text_width(atlas, s) as i32;
                     let draws = hud_layout::experience(
                         wi,
-                        hi,
+                        bottom_hi,
                         g.experience.progress,
                         g.experience.level,
                         contextual == ContextualBar::Experience,
@@ -8999,7 +9012,7 @@ impl Game<'_> {
                     hud_layout::paint(batch, atlas, &draws);
                 }
                 if contextual == ContextualBar::Locator {
-                    let draws = g.locator_bar_draws(wi, hi);
+                    let draws = g.locator_bar_draws(wi, bottom_hi);
                     hud_layout::paint(batch, &g.gui.atlas, &draws);
                 }
             });
@@ -9047,10 +9060,10 @@ impl Game<'_> {
                 // The native mods' health HUD (`native_health_hud`): a mod
                 // that answers draws every row instead.
                 let mut native_health_hud = None;
-                self.native_health_hud(&inputs, wi, hi, &mut native_health_hud);
+                self.native_health_hud(&inputs, wi, bottom_hi, &mut native_health_hud);
                 let draws = match native_health_hud {
                     Some(draws) => draws,
-                    None => self.health_hud.layout(&inputs, wi, hi),
+                    None => self.health_hud.layout(&inputs, wi, bottom_hi),
                 };
                 // The rows draw in one pass here, so a mod's `player_health`
                 // layer stands for the armor, food and air rows too.
@@ -9076,7 +9089,10 @@ impl Game<'_> {
             }
             if !spectator {
                 self.gui_layer("minecraft:selected_item_name", &mut batch, |g, batch| {
+                    let full_height = batch.height;
+                    batch.height = bottom_hi as f32;
                     g.draw_selected_name(batch, bar_height, !g.creative);
+                    batch.height = full_height;
                 });
             }
         }
@@ -10777,11 +10793,11 @@ impl Game<'_> {
     /// and a sneak the key no longer held: #4166's in-game report), so a
     /// cached key set is not vanilla's answer.
     pub(super) fn has_shift_down(&self) -> bool {
-        self.modifiers.shift_key()
+        self.modifiers.shift_key() || self.touch_shift_down()
     }
     /// The same live word for Control (`InputWithModifiers.hasControlDown`).
     pub(super) fn has_control_down(&self) -> bool {
-        self.modifiers.control_key()
+        self.modifiers.control_key() || self.touch_control_down()
     }
     /// Real events word the modifiers by their own `ModifiersChanged`; a
     /// control socket's `key` is synthesized, so it words the bit directly
@@ -17780,18 +17796,21 @@ impl Game<'_> {
         }
         if let WindowEvent::ModifiersChanged(m) = &event {
             self.modifiers = m.state();
+            let device_held = [
+                self.pad
+                    .holds_action(&self.settings.controller, "key.sneak")
+                    || self.touch_holds_action("key.sneak"),
+                self.pad
+                    .holds_action(&self.settings.controller, "key.sprint")
+                    || self.touch_holds_action("key.sprint"),
+            ];
             horizon_client_input::modifiers::reconcile(
                 self.modifiers,
                 &mut self.physical_keys,
                 &self.settings.keys,
                 &mut self.toggles,
                 [self.settings.toggle_crouch, self.settings.toggle_sprint],
-                [
-                    self.pad
-                        .holds_action(&self.settings.controller, "key.sneak"),
-                    self.pad
-                        .holds_action(&self.settings.controller, "key.sprint"),
-                ],
+                device_held,
             );
             self.sync_toggle(SNEAK);
             self.sync_toggle(SPRINT);
