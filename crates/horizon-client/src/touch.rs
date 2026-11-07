@@ -4,6 +4,12 @@
 //! buttons, and in menus a pointer from the first finger plus a small toolbar
 //! (back, shift, right click, scroll, keyboard).
 //!
+//! The world itself takes fingers too, the way Bedrock does: a quick tap on the
+//! world uses the item in hand at the crosshair, and holding a finger on the
+//! world breaks what the crosshair points at, for as long as the finger stays
+//! down — dragging while holding turns the view and the mining follows it. A
+//! drag that sets off before the hold lands is only a look, never a break.
+//!
 //! This is pure logic: fingers go in (`touch`), [`Action`]s come out for the game
 //! loop to carry out, and [`TouchControls::view`] says what to draw. It knows
 //! nothing of winit or the game, so it is tested on any machine. All sizes in the
@@ -17,6 +23,14 @@
 
 /// Hotbar slots.
 pub const HOTBAR_SLOTS: usize = 9;
+
+/// Seconds a finger must stay on the world, without a big drag, before it
+/// starts breaking what the crosshair points at. A lift sooner is a tap.
+pub const HOLD_TO_BREAK: f64 = 0.25;
+
+/// How far (dp) a finger on the world may wander from where it went down
+/// before it counts as a look drag rather than a press on the world.
+pub const WORLD_DRAG: f32 = 12.0;
 
 /// An on-screen button.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -190,7 +204,7 @@ impl Default for Layout {
             stick_zone: 0.42,
             deadzone: 0.14,
             sprint_push: 0.97,
-            slop: 8.0,
+            slop: 2.0,
             hotbar_reach: 14.0,
             scroll_repeat: 0.12,
             look_gain: 1.6,
@@ -242,6 +256,18 @@ impl Layout {
     }
 }
 
+/// The screen's edges that are not safe to draw controls on, in physical
+/// pixels: a notch or Dynamic Island, the home indicator, rounded corners.
+/// Controls keep at least this far from each edge, on top of the layout's
+/// own margin where that is bigger.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Insets {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
 /// The screen the controls are arranged for. Physical pixels, except `density`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Screen {
@@ -253,6 +279,8 @@ pub struct Screen {
     pub hotbar: Rect,
     /// The width of one hotbar slot.
     pub slot: f32,
+    /// The unsafe edges of this screen.
+    pub insets: Insets,
 }
 
 impl Screen {
@@ -269,6 +297,7 @@ impl Screen {
                 h: 0.0,
             },
             slot: 20.0 * density,
+            insets: Insets::default(),
         }
     }
 }
@@ -287,6 +316,12 @@ fn arrange(layout: &Layout, screen: Screen, mode: Mode) -> Arrangement {
     let short = screen.width.min(screen.height) / dp;
     let b = (short * layout.button_fraction).clamp(layout.button_min, layout.button_max) * dp;
     let m = layout.margin * dp;
+    // Each edge keeps the layout's margin or the screen's unsafe inset,
+    // whichever reaches further.
+    let m_left = m.max(screen.insets.left.max(0.0));
+    let m_top = m.max(screen.insets.top.max(0.0));
+    let m_right = m.max(screen.insets.right.max(0.0));
+    let m_bottom = m.max(screen.insets.bottom.max(0.0));
     let g = layout.gap * dp;
     let small = b * 0.78;
     let radius = (layout.stick_radius * dp).max(b);
@@ -299,23 +334,23 @@ fn arrange(layout: &Layout, screen: Screen, mode: Mode) -> Arrangement {
     // Rows of controls beside the hotbar sit on the bottom margin; where the
     // screen is too narrow for that (portrait) they rise above the hotbar.
     let cluster_width = 2.0 * b + g;
-    let cluster_left = screen.width - m - cluster_width;
+    let cluster_left = screen.width - m_right - cluster_width;
     let cluster_bottom = if hotbar.w > 0.0 && cluster_left < hotbar.x + hotbar.w + g {
         hotbar_top
     } else {
-        screen.height - m
+        screen.height - m_bottom
     };
-    let stick_right = m + 2.0 * radius;
+    let stick_right = m_left + 2.0 * radius;
     let stick_bottom = if hotbar.w > 0.0 && stick_right > hotbar.x - g {
         hotbar_top
     } else {
-        screen.height - m
+        screen.height - m_bottom
     };
     let home = (
-        (m + radius).min(screen.width / 2.0),
+        (m_left + radius).min(screen.width / 2.0),
         (stick_bottom - radius).max(radius),
     );
-    let right = screen.width - m;
+    let right = screen.width - m_right;
     let mut buttons = Vec::new();
     match mode {
         Mode::Playing => {
@@ -331,14 +366,14 @@ fn arrange(layout: &Layout, screen: Screen, mode: Mode) -> Arrangement {
             buttons.push((Button::Sneak, cell(1.0, 1.0)));
             let top = |x: f32| Rect {
                 x,
-                y: m,
+                y: m_top,
                 w: small,
                 h: small,
             };
-            buttons.push((Button::Pause, top(m)));
-            buttons.push((Button::Chat, top(m + small + g)));
-            buttons.push((Button::Inventory, top(screen.width - m - small)));
-            buttons.push((Button::Drop, top(screen.width - m - 2.0 * small - g)));
+            buttons.push((Button::Pause, top(m_left)));
+            buttons.push((Button::Chat, top(m_left + small + g)));
+            buttons.push((Button::Inventory, top(screen.width - m_right - small)));
+            buttons.push((Button::Drop, top(screen.width - m_right - 2.0 * small - g)));
         }
         Mode::Menu => {
             let order = [
@@ -350,12 +385,12 @@ fn arrange(layout: &Layout, screen: Screen, mode: Mode) -> Arrangement {
                 Button::Keyboard,
             ];
             let total = order.len() as f32 * small + (order.len() as f32 - 1.0) * g;
-            let top = ((screen.height - total) / 2.0).max(m);
+            let top = ((screen.height - total) / 2.0).max(m_top);
             for (i, button) in order.into_iter().enumerate() {
                 buttons.push((
                     button,
                     Rect {
-                        x: m,
+                        x: m_left,
                         y: top + i as f32 * (small + g),
                         w: small,
                         h: small,
@@ -382,6 +417,20 @@ enum Role {
     Ignored,
 }
 
+/// What a finger resting on the world (a `Role::Look` finger in the game)
+/// is doing with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum World {
+    /// Still deciding: a quick lift is a tap (use), staying down past
+    /// [`HOLD_TO_BREAK`] starts breaking, a big drag makes it a look.
+    Pending,
+    /// A look drag, or a finger world touches no longer apply to: it never
+    /// taps or breaks.
+    Looking,
+    /// Holding `key.attack` on the world: breaking until it lifts.
+    Breaking,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Finger {
     id: u64,
@@ -389,10 +438,16 @@ struct Finger {
     last: (f32, f32),
     /// Where it went down.
     start: (f32, f32),
+    /// When it went down, in seconds (the world hold counts from here).
+    down_at: f64,
     /// Hotbar swipe distance not yet turned into steps.
     swipe: f32,
     /// A look drag has gone past the slop (so small shakes do not turn the view).
     moved: bool,
+    world: World,
+    /// This finger holds a button it slid onto, not one it landed on: sliding
+    /// off lets go of it again (a finger that landed on a button keeps it).
+    slid: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -444,6 +499,8 @@ pub struct TouchControls {
     /// The menu pointer's right-click state when it went down.
     pointer_right: bool,
     scroll_at: f64,
+    /// Tap and hold on the world itself to use and break (the Touch options).
+    world_touch: bool,
 }
 
 impl TouchControls {
@@ -464,6 +521,7 @@ impl TouchControls {
             right_next: false,
             pointer_right: false,
             scroll_at: 0.0,
+            world_touch: true,
         }
     }
 
@@ -487,6 +545,50 @@ impl TouchControls {
     pub fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
         self.arranged = arrange(&self.layout, self.screen, self.mode);
+    }
+
+    /// Whether fingers on the world itself tap to use and hold to break.
+    pub fn world_touch(&self) -> bool {
+        self.world_touch
+    }
+
+    /// Turns world taps and holds on or off (the Touch options). Turning it
+    /// off lets go of a world hold at once and spends every pending press:
+    /// a finger already down never taps or starts breaking afterwards.
+    /// Returns what that releases.
+    pub fn set_world_touch(&mut self, on: bool) -> Vec<Action> {
+        if self.world_touch == on {
+            return Vec::new();
+        }
+        self.world_touch = on;
+        let mut out = Vec::new();
+        if !on {
+            for i in 0..self.fingers.len() {
+                if self.fingers[i].world == World::Breaking {
+                    self.fingers[i].world = World::Looking;
+                    out.extend(self.release_button(Button::Break));
+                } else if self.fingers[i].world == World::Pending {
+                    self.fingers[i].world = World::Looking;
+                }
+            }
+        }
+        out
+    }
+
+    /// Marks a button held and says so.
+    fn press_button(&mut self, button: Button, out: &mut Vec<Action>) {
+        self.held.push(button);
+        out.push(Action::Press(button));
+    }
+
+    /// Lets go of one hold on a button, if any.
+    fn release_button(&mut self, button: Button) -> Vec<Action> {
+        if let Some(at) = self.held.iter().position(|b| *b == button) {
+            self.held.remove(at);
+            vec![Action::Release(button)]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Switches between the world's controls and the menus', letting go of
@@ -617,23 +719,21 @@ impl TouchControls {
         x < self.screen.width * self.layout.stick_zone && y > self.screen.height * 0.25
     }
 
-    fn finger_mut(&mut self, id: u64) -> Option<&mut Finger> {
-        self.fingers.iter_mut().find(|f| f.id == id)
-    }
-
     /// A finger touched, moved or lifted. `now` is in seconds.
     pub fn touch(&mut self, id: u64, phase: Phase, x: f32, y: f32, now: f64) -> Vec<Action> {
         match phase {
             Phase::Started => self.started(id, x, y, now),
             Phase::Moved => self.moved(id, x, y),
-            Phase::Ended | Phase::Cancelled => self.ended(id, x, y),
+            // A cancelled touch is a lift, but never a tap.
+            Phase::Ended => self.ended(id, true, now),
+            Phase::Cancelled => self.ended(id, false, now),
         }
     }
 
     fn started(&mut self, id: u64, x: f32, y: f32, now: f64) -> Vec<Action> {
         // A finger id reused without an end (a lost event): start it afresh.
         let mut out = if self.fingers.iter().any(|f| f.id == id) {
-            self.ended(id, x, y)
+            self.ended(id, false, now)
         } else {
             Vec::new()
         };
@@ -642,8 +742,7 @@ impl TouchControls {
             Mode::Playing => {
                 if let Some(button) = self.button_at(x, y) {
                     role = Role::Button(button);
-                    self.held.push(button);
-                    out.push(Action::Press(button));
+                    self.press_button(button, &mut out);
                 } else if self.on_hotbar(x, y) {
                     role = Role::Hotbar;
                     out.push(Action::SelectSlot(self.slot_at(x)));
@@ -689,8 +788,15 @@ impl TouchControls {
             role,
             last: (x, y),
             start: (x, y),
+            down_at: now,
             swipe: 0.0,
             moved: false,
+            world: if role == Role::Look && self.world_touch {
+                World::Pending
+            } else {
+                World::Looking
+            },
+            slid: false,
         });
         out
     }
@@ -724,35 +830,61 @@ impl TouchControls {
         let dp = self.screen.density.max(0.1);
         let slop = self.layout.slop * dp;
         let slot = self.screen.slot.max(1.0);
-        let Some(finger) = self.finger_mut(id) else {
+        let Some(i) = self.fingers.iter().position(|f| f.id == id) else {
             return Vec::new();
         };
-        let (dx, dy) = (x - finger.last.0, y - finger.last.1);
-        let role = finger.role;
         let mut out = Vec::new();
-        match role {
+        match self.fingers[i].role {
             Role::Look => {
+                // Sliding onto a button claims the finger for that button
+                // (the stick finger never has this role, and menus keep
+                // their pointer). A world hold ends before the press.
+                if self.mode == Mode::Playing
+                    && let Some(button) = self.button_at(x, y)
+                {
+                    if self.fingers[i].world == World::Breaking {
+                        self.fingers[i].world = World::Looking;
+                        out.extend(self.release_button(Button::Break));
+                    }
+                    self.fingers[i].role = Role::Button(button);
+                    self.fingers[i].slid = true;
+                    self.fingers[i].last = (x, y);
+                    self.press_button(button, &mut out);
+                    return out;
+                }
+                let finger = &mut self.fingers[i];
+                let (sx, sy) = (x - finger.start.0, y - finger.start.1);
+                // A big drag before the hold lands is a look, never a break.
+                if finger.world == World::Pending && sx.hypot(sy) > WORLD_DRAG * dp {
+                    finger.world = World::Looking;
+                }
                 if !finger.moved {
-                    let (sx, sy) = (x - finger.start.0, y - finger.start.1);
-                    if sx.hypot(sy) < slop {
+                    let len = sx.hypot(sy);
+                    if len < slop {
                         return out;
                     }
                     finger.moved = true;
-                    // The slop travelled is not lost: turn by all of it once.
+                    // Only the travel past the slop turns the view, so the
+                    // first step is the size of any other, not a lurch. The
+                    // slop itself is spent once: later moves count from
+                    // where the finger actually is.
+                    let keep = (len - slop) / len;
                     out.push(Action::Look {
-                        dx: sx / dp,
-                        dy: sy / dp,
+                        dx: sx * keep / dp,
+                        dy: sy * keep / dp,
                     });
+                    finger.last = (x, y);
                 } else {
                     out.push(Action::Look {
-                        dx: dx / dp,
-                        dy: dy / dp,
+                        dx: (x - finger.last.0) / dp,
+                        dy: (y - finger.last.1) / dp,
                     });
+                    finger.last = (x, y);
                 }
-                finger.last = (x, y);
             }
             Role::Hotbar => {
-                finger.swipe += dx;
+                let finger = &mut self.fingers[i];
+                finger.swipe += x - finger.last.0;
                 finger.last = (x, y);
                 while finger.swipe >= slot {
                     finger.swipe -= slot;
@@ -764,17 +896,44 @@ impl TouchControls {
                 }
             }
             Role::Pointer => {
-                finger.last = (x, y);
+                self.fingers[i].last = (x, y);
                 out.push(Action::PointerMove { x, y });
             }
             Role::Stick => {
-                finger.last = (x, y);
+                self.fingers[i].last = (x, y);
                 if let Some(stick) = self.stick.as_mut().filter(|s| s.id == id) {
                     stick.at = (x, y);
                 }
                 out.extend(self.stick_update());
             }
-            Role::Button(_) | Role::Ignored => finger.last = (x, y),
+            Role::Button(button) => {
+                self.fingers[i].last = (x, y);
+                // A finger that slid onto its button follows the finger:
+                // off it lets go, onto the next one hands over. A finger
+                // that landed on its button keeps it wherever it wanders.
+                if self.fingers[i].slid {
+                    match self.button_at(x, y) {
+                        Some(next) if next == button => {}
+                        Some(next) => {
+                            out.extend(self.release_button(button));
+                            self.fingers[i].role = Role::Button(next);
+                            self.press_button(next, &mut out);
+                        }
+                        None => {
+                            out.extend(self.release_button(button));
+                            let finger = &mut self.fingers[i];
+                            finger.role = Role::Look;
+                            finger.slid = false;
+                            // It has done its pressing: it only looks now.
+                            finger.world = World::Looking;
+                            finger.moved = true;
+                            finger.start = (x, y);
+                            finger.last = (x, y);
+                        }
+                    }
+                }
+            }
+            Role::Ignored => self.fingers[i].last = (x, y),
         }
         out
     }
@@ -819,7 +978,7 @@ impl TouchControls {
         out
     }
 
-    fn ended(&mut self, id: u64, _x: f32, _y: f32) -> Vec<Action> {
+    fn ended(&mut self, id: u64, tap: bool, now: f64) -> Vec<Action> {
         let Some(i) = self.fingers.iter().position(|f| f.id == id) else {
             return Vec::new();
         };
@@ -827,10 +986,7 @@ impl TouchControls {
         let mut out = Vec::new();
         match finger.role {
             Role::Button(button) => {
-                if let Some(at) = self.held.iter().position(|b| *b == button) {
-                    self.held.remove(at);
-                    out.push(Action::Release(button));
-                }
+                out.extend(self.release_button(button));
             }
             Role::Stick => {
                 self.stick = None;
@@ -852,17 +1008,45 @@ impl TouchControls {
                     self.right_next = false;
                 }
             }
-            Role::Look | Role::Hotbar | Role::Ignored => {}
+            Role::Look => {
+                if finger.world == World::Breaking {
+                    // The hold is over: stop breaking.
+                    out.extend(self.release_button(Button::Break));
+                } else if tap
+                    && finger.world == World::Pending
+                    && self.mode == Mode::Playing
+                    && self.world_touch
+                    && now - finger.down_at < HOLD_TO_BREAK
+                {
+                    // A tap on the world: use what the crosshair points at.
+                    out.push(Action::Press(Button::Place));
+                    out.push(Action::Release(Button::Place));
+                }
+            }
+            Role::Hotbar | Role::Ignored => {}
         }
         out
     }
 
-    /// Called every frame: repeats a held scroll button.
+    /// Called every frame: starts a world hold that has been down long
+    /// enough, and repeats a held scroll button.
     pub fn update(&mut self, now: f64) -> Vec<Action> {
-        if self.mode != Mode::Menu {
-            return Vec::new();
-        }
         let mut out = Vec::new();
+        if self.mode == Mode::Playing && self.world_touch {
+            for i in 0..self.fingers.len() {
+                let finger = &self.fingers[i];
+                if finger.role == Role::Look
+                    && finger.world == World::Pending
+                    && now - finger.down_at >= HOLD_TO_BREAK
+                {
+                    self.fingers[i].world = World::Breaking;
+                    self.press_button(Button::Break, &mut out);
+                }
+            }
+        }
+        if self.mode != Mode::Menu {
+            return out;
+        }
         for finger in &self.fingers {
             let Role::Button(button) = finger.role else {
                 continue;
@@ -900,6 +1084,7 @@ mod tests {
                 h: 22.0 * s,
             },
             slot: 20.0 * s,
+            insets: Insets::default(),
         }
     }
 
@@ -917,6 +1102,7 @@ mod tests {
                 h: 22.0 * s,
             },
             slot: 20.0 * s,
+            insets: Insets::default(),
         }
     }
 
@@ -934,6 +1120,7 @@ mod tests {
                 h: 22.0 * s,
             },
             slot: 20.0 * s,
+            insets: Insets::default(),
         }
     }
 
@@ -1100,14 +1287,15 @@ mod tests {
         let mut c = TouchControls::new(Layout::default(), cover());
         let dp = 2.625;
         c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
-        // A shake under 8 dp turns nothing.
-        assert!(c.touch(1, Phase::Moved, 1505.0, 402.0, 0.1).is_empty());
-        // Past it: all the travel since the start, then deltas.
+        // A shake under 2 dp turns nothing.
+        assert!(c.touch(1, Phase::Moved, 1503.0, 401.0, 0.1).is_empty());
+        // Past it: the travel beyond the slop (40 dp of drag turns 38), so
+        // the first step is no bigger than the ones that follow.
         let out = c.touch(1, Phase::Moved, 1500.0 + 40.0 * dp, 400.0, 0.2);
         assert_eq!(out.len(), 1);
         match out[0] {
             Action::Look { dx, dy } => {
-                assert!((dx - 40.0).abs() < 1e-3 && dy.abs() < 1e-3, "{dx} {dy}");
+                assert!((dx - 38.0).abs() < 1e-3 && dy.abs() < 1e-3, "{dx} {dy}");
             }
             ref other => panic!("{other:?}"),
         }
@@ -1378,6 +1566,192 @@ mod tests {
         assert_eq!(
             out,
             vec![Action::Release(Button::Break), Action::Press(Button::Break)]
+        );
+    }
+
+    #[test]
+    fn a_tap_on_the_world_uses_what_the_crosshair_points_at() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        assert!(c.touch(1, Phase::Started, 1500.0, 400.0, 0.0).is_empty());
+        // Down and up again quickly, barely moved: a use, pressed and let go.
+        assert_eq!(
+            c.touch(1, Phase::Ended, 1502.0, 401.0, 0.1),
+            vec![Action::Press(Button::Place), Action::Release(Button::Place)]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_world_touch_is_not_a_tap() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        assert!(c.touch(1, Phase::Cancelled, 1500.0, 400.0, 0.1).is_empty());
+    }
+
+    #[test]
+    fn holding_on_the_world_breaks_until_the_finger_lifts() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        // Not yet: the hold has to last.
+        assert!(c.update(0.2).is_empty());
+        assert_eq!(c.update(0.26), vec![Action::Press(Button::Break)]);
+        // It does not press twice, and the Break button shows it.
+        assert!(c.update(0.4).is_empty());
+        assert!(
+            c.view()
+                .buttons
+                .iter()
+                .any(|b| b.button == Button::Break && b.lit)
+        );
+        assert_eq!(
+            c.touch(1, Phase::Ended, 1500.0, 400.0, 0.5),
+            vec![Action::Release(Button::Break)]
+        );
+    }
+
+    #[test]
+    fn holding_and_dragging_keeps_breaking_while_it_looks() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        let dp = 2.625;
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        assert_eq!(c.update(0.3), vec![Action::Press(Button::Break)]);
+        // Dragging turns the view and the break stays held.
+        let out = c.touch(1, Phase::Moved, 1500.0 + 40.0 * dp, 400.0, 0.4);
+        assert!(matches!(out[..], [Action::Look { .. }]), "{out:?}");
+        assert!(
+            c.view()
+                .buttons
+                .iter()
+                .any(|b| b.button == Button::Break && b.lit)
+        );
+        assert_eq!(
+            c.touch(1, Phase::Ended, 0.0, 0.0, 0.5),
+            vec![Action::Release(Button::Break)]
+        );
+    }
+
+    #[test]
+    fn a_big_drag_before_the_hold_is_only_a_look() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        let dp = 2.625;
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        // Away past the world-drag distance at once: a look, and no hold
+        // ever starts under it, however long it stays down.
+        let out = c.touch(1, Phase::Moved, 1500.0 + 40.0 * dp, 400.0, 0.1);
+        assert!(matches!(out[..], [Action::Look { .. }]), "{out:?}");
+        assert!(c.update(0.6).is_empty());
+        assert!(c.touch(1, Phase::Ended, 0.0, 0.0, 0.7).is_empty());
+    }
+
+    #[test]
+    fn a_small_wander_still_holds_and_never_taps_after_a_drag() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        let dp = 2.625;
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        // 5 dp of wander: under the world-drag distance, so the hold lands.
+        c.touch(1, Phase::Moved, 1500.0 + 5.0 * dp, 400.0, 0.1);
+        assert_eq!(c.update(0.3), vec![Action::Press(Button::Break)]);
+        assert_eq!(
+            c.touch(1, Phase::Ended, 0.0, 0.0, 0.4),
+            vec![Action::Release(Button::Break)]
+        );
+    }
+
+    #[test]
+    fn world_touch_off_means_no_taps_and_no_holds() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        assert!(c.set_world_touch(false).is_empty());
+        assert!(!c.world_touch());
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        assert!(c.update(0.5).is_empty());
+        assert!(c.touch(1, Phase::Ended, 1500.0, 400.0, 0.6).is_empty());
+        // A fresh tap with it off is only a look finger too.
+        c.touch(2, Phase::Started, 1500.0, 400.0, 1.0);
+        assert!(c.touch(2, Phase::Ended, 1500.0, 400.0, 1.1).is_empty());
+    }
+
+    #[test]
+    fn turning_world_touch_off_mid_hold_lets_go() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        assert_eq!(c.update(0.3), vec![Action::Press(Button::Break)]);
+        assert_eq!(
+            c.set_world_touch(false),
+            vec![Action::Release(Button::Break)]
+        );
+        assert!(c.touch(1, Phase::Ended, 1500.0, 400.0, 0.4).is_empty());
+    }
+
+    #[test]
+    fn sliding_onto_a_button_presses_it_and_sliding_off_lets_go() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        let brk = rect_of(&c, Button::Break).centre();
+        let place = rect_of(&c, Button::Place).centre();
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        // Onto Break: it presses without the finger ever lifting.
+        assert_eq!(
+            c.touch(1, Phase::Moved, brk.0, brk.1, 0.1),
+            vec![Action::Press(Button::Break)]
+        );
+        // Across to Place: one lets go as the other presses.
+        assert_eq!(
+            c.touch(1, Phase::Moved, place.0, place.1, 0.2),
+            vec![Action::Release(Button::Break), Action::Press(Button::Place)]
+        );
+        // Off the buttons entirely: let go, and the finger only looks now.
+        assert_eq!(
+            c.touch(1, Phase::Moved, 1500.0, 400.0, 0.3),
+            vec![Action::Release(Button::Place)]
+        );
+        assert!(c.touch(1, Phase::Ended, 1500.0, 400.0, 0.4).is_empty());
+    }
+
+    #[test]
+    fn sliding_onto_a_button_ends_a_world_hold_first() {
+        let mut c = TouchControls::new(Layout::default(), cover());
+        let jump = rect_of(&c, Button::Jump).centre();
+        c.touch(1, Phase::Started, 1500.0, 400.0, 0.0);
+        assert_eq!(c.update(0.3), vec![Action::Press(Button::Break)]);
+        assert_eq!(
+            c.touch(1, Phase::Moved, jump.0, jump.1, 0.4),
+            vec![Action::Release(Button::Break), Action::Press(Button::Jump)]
+        );
+        assert_eq!(
+            c.touch(1, Phase::Ended, 0.0, 0.0, 0.5),
+            vec![Action::Release(Button::Jump)]
+        );
+    }
+
+    #[test]
+    fn the_safe_area_pushes_the_controls_in() {
+        let mut screen = cover();
+        screen.insets = Insets {
+            left: 100.0,
+            top: 80.0,
+            right: 120.0,
+            bottom: 80.0,
+        };
+        let c = TouchControls::new(Layout::default(), screen);
+        // The bottom-right cluster clears the right and bottom insets
+        // (both beyond the layout's own 20 dp margin at this density).
+        let brk = rect_of(&c, Button::Break);
+        assert!(
+            (brk.x + brk.w - (screen.width - 120.0)).abs() < 0.01,
+            "{brk:?}"
+        );
+        assert!(
+            (brk.y + brk.h - (screen.height - 80.0)).abs() < 0.01,
+            "{brk:?}"
+        );
+        // The top row clears the top, and the stick rests clear of the left.
+        let pause = rect_of(&c, Button::Pause);
+        assert!(
+            (pause.x - 100.0).abs() < 0.01 && (pause.y - 80.0).abs() < 0.01,
+            "{pause:?}"
+        );
+        let stick = c.view().stick;
+        assert!(
+            (stick.base.0 - stick.radius - 100.0).abs() < 0.01,
+            "{stick:?}"
         );
     }
 }
