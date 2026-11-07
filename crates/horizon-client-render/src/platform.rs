@@ -151,6 +151,31 @@ fn intersect_fps_caps(
     cap
 }
 
+// ---- render resolution ------------------------------------------------------------------
+
+/// The longest edge, in pixels, the world may render at on iOS: 720p class
+/// while any power saving is on (the phone seed's default), 1080p class as the
+/// pushed option, and never more — a phone panel's native size (2532x1170, let
+/// alone the desktop-flavoured 3840x2100 a windowed default asks for) is more
+/// pixels than the game needs to draw. `None` where no cap applies: every
+/// platform other than iOS keeps the resolution scale exactly as the player
+/// set it. The window and the HUD keep the panel's size; only the world's
+/// render target is capped (`gfx::world_post`).
+pub fn render_long_edge_cap(battery_mode: bool) -> Option<u32> {
+    if !cfg!(target_os = "ios") {
+        return None;
+    }
+    Some(phone_render_long_edge_cap(battery_mode, low_power_mode()))
+}
+
+fn phone_render_long_edge_cap(battery_mode: bool, os_low_power: bool) -> u32 {
+    if battery_mode || os_low_power {
+        1280
+    } else {
+        1920
+    }
+}
+
 // ---- pointer events ------------------------------------------------------------------------
 
 /// A mouse button, as Android's `MotionEvent.BUTTON_*` bits name them.
@@ -283,6 +308,14 @@ mod tests {
         assert_eq!(thermal_fps_cap(thermal::CRITICAL), Some(20));
         assert_eq!(thermal_fps_cap(thermal::SHUTDOWN), Some(20));
         assert_eq!(thermal_fps_cap(-1), None);
+    }
+
+    #[test]
+    fn phone_render_cap_is_720p_under_power_saving_and_1080p_pushed() {
+        assert_eq!(phone_render_long_edge_cap(true, false), 1280);
+        assert_eq!(phone_render_long_edge_cap(false, true), 1280);
+        assert_eq!(phone_render_long_edge_cap(true, true), 1280);
+        assert_eq!(phone_render_long_edge_cap(false, false), 1920);
     }
 
     #[test]
