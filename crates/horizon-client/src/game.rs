@@ -21257,6 +21257,51 @@ fn prepare_renderer_textures(pack: &PackResources) -> horizon_client::gfx::Prepa
 }
 
 /// Upload pack textures and create the renderer on the window's device.
+/// Runs `work` on a thread with a stack sized for renderer creation and
+/// returns what it returns.
+///
+/// Creating a renderer (`Renderer::new_with_seed` driven by
+/// `pollster::block_on`) nests deep: device open, shader and pipeline
+/// builds, texture uploads. The winit event loop runs on the main thread,
+/// whose stack is ~1 MB on iOS (a desktop main thread gets ~8 MB), and
+/// building the loading renderer there overflowed it: the phone died with
+/// a stack-guard fault at the creation call while the same start is fine
+/// on desktop. A scoped thread keeps the borrows the creation reads (the
+/// pack's and the atlas's pixels) valid without copying them, and the
+/// finished renderer crosses back through the join. A panic in the work
+/// resumes here, as it would have had the work run inline.
+fn on_creation_stack<T, F>(work: F) -> T
+where
+    T: Send,
+    F: FnOnce() -> T + Send,
+{
+    /// What renderer creation gets: a desktop main thread's worth, times two.
+    const STACK: usize = 16 * 1024 * 1024;
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("renderer-creation".to_owned())
+            .stack_size(STACK)
+            .spawn_scoped(scope, work)
+            // A process that cannot spawn one thread is out of resources
+            // entirely; the start cannot continue either way.
+            .expect("the renderer creation thread did not spawn");
+        match handle.join() {
+            Ok(value) => value,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// [`on_creation_stack`] for renderer creation: the game's error is a boxed
+/// trait object, which is not `Send`, so its message crosses the thread
+/// boundary and the box is rebuilt on this side.
+fn create_renderer<F>(work: F) -> Result<Renderer>
+where
+    F: FnOnce() -> Result<Renderer> + Send,
+{
+    on_creation_stack(move || work().map_err(|e| e.to_string())).map_err(Into::into)
+}
+
 fn build_renderer(
     window: Arc<Window>,
     offscreen: bool,
@@ -21317,31 +21362,42 @@ fn build_renderer_with_seed(
     // Made here when the worker did not: the renderer's own fallback has no LabPBR maps.
     let prepared = Some(prepared.unwrap_or_else(|| prepare_renderer_textures(pack)));
     let atlas_pixels = atlas.pixels();
-    let mut renderer = pollster::block_on(Renderer::new_with_seed(
-        window,
-        offscreen,
-        &assets.pixels.get(),
-        assets.sprite_size,
-        assets.sprite_minimum_size,
-        assets.texture_layers,
-        &assets.sprite_mips,
-        &assets.animations,
-        (&atlas_pixels, atlas.width, atlas.height),
-        (&atlas.glint.0, atlas.glint.1, atlas.glint.2),
-        (
-            &atlas.glint_armor.0,
-            atlas.glint_armor.1,
-            atlas.glint_armor.2,
-        ),
-        (&pack.forcefield.2, pack.forcefield.0),
-        gui.panorama.clone(),
-        prepared,
-        previous,
-        api,
-        translucent_batching,
-        wide_frame,
-        shader_pack,
-    ))?;
+    // The creation runs on another thread (see `create_renderer`), which the
+    // atlas cannot follow: its font cache is single-threaded. What the
+    // creation reads from it is plain pixels, taken out here.
+    let hud_atlas = (&atlas_pixels[..], atlas.width, atlas.height);
+    let glint = (&atlas.glint.0[..], atlas.glint.1, atlas.glint.2);
+    let glint_armor = (
+        &atlas.glint_armor.0[..],
+        atlas.glint_armor.1,
+        atlas.glint_armor.2,
+    );
+    // Likewise the panorama: the bundle cannot follow (same font cache, via
+    // its atlas), the faces are an `Arc`.
+    let panorama = gui.panorama.clone();
+    let mut renderer = create_renderer(|| {
+        pollster::block_on(Renderer::new_with_seed(
+            window,
+            offscreen,
+            &assets.pixels.get(),
+            assets.sprite_size,
+            assets.sprite_minimum_size,
+            assets.texture_layers,
+            &assets.sprite_mips,
+            &assets.animations,
+            hud_atlas,
+            glint,
+            glint_armor,
+            (&pack.forcefield.2, pack.forcefield.0),
+            panorama,
+            prepared,
+            previous,
+            api,
+            translucent_batching,
+            wide_frame,
+            shader_pack,
+        ))
+    })?;
     renderer.hud.sprite_animations = atlas
         .sprite_animations
         .iter()
@@ -21401,29 +21457,31 @@ fn loading_renderer(
     if let Some(atlas) = atlas {
         atlas.font.reset_cache();
     }
-    let mut renderer = pollster::block_on(Renderer::new_with_seed(
-        window,
-        offscreen,
-        &[255, 255, 255, 255],
-        1,
-        1,
-        1,
-        &[],
-        &[],
-        (pixels, width, height),
-        (glint_pixels, glint_width, glint_height),
-        (glint_pixels, glint_width, glint_height),
-        (&FORCEFIELD[..], 1),
-        panorama,
-        None,
-        previous,
-        api,
-        // It draws no terrain.
-        false,
-        // An 8-bit frame, which HDR output takes as well.
-        false,
-        false,
-    ))?;
+    let mut renderer = create_renderer(|| {
+        pollster::block_on(Renderer::new_with_seed(
+            window,
+            offscreen,
+            &[255, 255, 255, 255],
+            1,
+            1,
+            1,
+            &[],
+            &[],
+            (pixels, width, height),
+            (glint_pixels, glint_width, glint_height),
+            (glint_pixels, glint_width, glint_height),
+            (&FORCEFIELD[..], 1),
+            panorama,
+            None,
+            previous,
+            api,
+            // It draws no terrain.
+            false,
+            // An 8-bit frame, which HDR output takes as well.
+            false,
+            false,
+        ))
+    })?;
     if let Some(atlas) = atlas {
         renderer.hud.sprite_animations = atlas
             .sprite_animations
