@@ -6609,6 +6609,11 @@ impl Renderer {
     pub fn set_dynamic_frame_budget(&mut self, fps: u32) {
         self.dynamic_resolution.set_budget(fps);
     }
+    /// The platform's cap on the world's rendered size (`platform::render_long_edge_cap`):
+    /// a phone's 720p/1080p classes. `None` leaves the resolution scale uncapped.
+    pub fn set_render_cap(&mut self, cap: Option<u32>) {
+        self.world_post.render_cap = cap;
+    }
     /// Runs `post` over the world from now on (`None`: no pack), for the dimension `dimension`;
     /// `block_ids` gives each block sprite layer's `mc_Entity` (id, fluid) and `at_midBlock.w`
     /// (its block's light), three values a layer.
