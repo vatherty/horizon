@@ -21344,6 +21344,199 @@ fn build_renderer(
     .map(|renderer| *renderer)
 }
 
+/// Everything the world renderer's creation reads, taken out of the pack
+/// and the menu bundle as owned data (see [`prepare_world_renderer_build`]):
+/// the creation runs on another thread — the creation thread under
+/// `create_renderer`'s join, or the handoff's worker — and the atlas it
+/// reads cannot follow it there (its font cache is single-threaded), nor
+/// can the pack's borrowed slices. What is shared crosses as an `Arc`
+/// (the render assets, the panorama, the forcefield); what is the
+/// atlas's crosses as a copy, as the loading screen's builds already
+/// take theirs ([`spawn_loading_renderer`]).
+struct WorldRendererBuild {
+    window: Arc<Window>,
+    offscreen: bool,
+    assets: Arc<RenderAssets>,
+    hud_atlas: (Vec<u8>, u32, u32),
+    glint: (Vec<u8>, u32, u32),
+    glint_armor: (Vec<u8>, u32, u32),
+    forcefield: Arc<(u32, u32, Vec<u8>)>,
+    panorama: Arc<horizon_client::gfx::panorama::Faces>,
+    prepared: Option<horizon_client::gfx::PreparedTextures>,
+    previous: Option<horizon_client::gfx::RendererSeed>,
+    premade: Option<horizon_client::gfx::PremadeSurface>,
+    api: horizon_client::graphics::GraphicsApi,
+    translucent_batching: bool,
+    // HDR with Smooth Gradients (`Graphics::wide_frame`): a 16-bit frame where HDR output is
+    // offered (`Renderer::new`).
+    wide_frame: bool,
+    shader_pack: bool,
+}
+
+impl WorldRendererBuild {
+    /// The creation, through `create_renderer`'s big-stack thread: joined
+    /// by the caller when the caller is the event loop (the synchronous
+    /// builds), joined by the worker when the caller is the handoff
+    /// (`spawn_world_renderer`). The renderer is boxed here, on the
+    /// creation thread, so a caller on the event loop holds only the box.
+    fn create(self) -> Result<Box<Renderer>> {
+        let Self {
+            window,
+            offscreen,
+            assets,
+            hud_atlas,
+            glint,
+            glint_armor,
+            forcefield,
+            panorama,
+            prepared,
+            previous,
+            premade,
+            api,
+            translucent_batching,
+            wide_frame,
+            shader_pack,
+        } = self;
+        create_renderer(|| {
+            pollster::block_on(Renderer::new_with_seed(
+                window,
+                offscreen,
+                &assets.pixels.get(),
+                assets.sprite_size,
+                assets.sprite_minimum_size,
+                assets.texture_layers,
+                &assets.sprite_mips,
+                &assets.animations,
+                (&hud_atlas.0[..], hud_atlas.1, hud_atlas.2),
+                (&glint.0[..], glint.1, glint.2),
+                (&glint_armor.0[..], glint_armor.1, glint_armor.2),
+                (&forcefield.2, forcefield.0),
+                panorama,
+                prepared,
+                previous,
+                premade,
+                api,
+                translucent_batching,
+                wide_frame,
+                shader_pack,
+            ))
+            .map(Box::new)
+        })
+    }
+}
+
+/// Takes the world renderer's build out of the pack and the menu bundle,
+/// on the caller's thread: the font's cache is reset and the prepared
+/// textures are made if the loader's worker did not make them, and the
+/// window's surface is settled — the part that pins this to the caller's
+/// thread. What the creation reads then crosses to it as owned data
+/// ([`WorldRendererBuild`]); what it leaves for the caller's thread is
+/// [`finish_world_renderer`], run when the renderer lands.
+#[allow(clippy::too_many_arguments)]
+fn prepare_world_renderer_build(
+    window: Arc<Window>,
+    offscreen: bool,
+    pack: &PackResources,
+    gui: &UiResources,
+    previous: Option<horizon_client::gfx::RendererSeed>,
+    prepared: Option<horizon_client::gfx::PreparedTextures>,
+    api: horizon_client::graphics::GraphicsApi,
+    translucent_batching: bool,
+    // HDR with Smooth Gradients (`Graphics::wide_frame`): a 16-bit frame where HDR output is
+    // offered (`Renderer::new`).
+    wide_frame: bool,
+    shader_pack: bool,
+) -> Result<WorldRendererBuild> {
+    let assets = &pack.render;
+    let atlas = &gui.atlas;
+    // The new renderer's atlas texture starts from `HudAtlas.pixels`, which
+    // holds the textures but never a glyph rasterized at run time. The font's
+    // cache still answers with the rects it drew into the previous renderer's
+    // texture, so forget them: the glyphs that are drawn again are placed into
+    // this texture (as `ui_theme` does when its atlas changes). Without this,
+    // Chinese and Japanese menu labels go blank when the loading screen hands
+    // over to the game.
+    atlas.font.reset_cache();
+    // Made here when the worker did not: the renderer's own fallback has no LabPBR maps.
+    let prepared = Some(prepared.unwrap_or_else(|| prepare_renderer_textures(pack)));
+    // The creation runs on another thread (see `create_renderer`), which the
+    // atlas cannot follow: its font cache is single-threaded. What the
+    // creation reads from it is plain pixels, taken out here.
+    let hud_atlas = (atlas.pixels().into_owned(), atlas.width, atlas.height);
+    let glint = (atlas.glint.0.clone(), atlas.glint.1, atlas.glint.2);
+    let glint_armor = (
+        atlas.glint_armor.0.clone(),
+        atlas.glint_armor.1,
+        atlas.glint_armor.2,
+    );
+    // Likewise the panorama: the bundle cannot follow (same font cache, via
+    // its atlas), the faces are an `Arc`.
+    let panorama = gui.panorama.clone();
+    // The creation runs on another thread (see `create_renderer`): a
+    // surface it had to make there could not be made at all on iOS, so the
+    // window's surface is settled here, on the caller's thread — a seeded
+    // build takes its surface from the seed, prepared now if the seed
+    // holds none; a fresh build takes a premade instance and surface.
+    let mut previous = previous;
+    if let Some(seed) = &mut previous
+        && !offscreen
+    {
+        seed.prepare_surface(&window)?;
+    }
+    let premade = if previous.is_none() && !offscreen {
+        Some(horizon_client::gfx::premake_surface(&window, api)?)
+    } else {
+        None
+    };
+    Ok(WorldRendererBuild {
+        window,
+        offscreen,
+        assets: assets.clone(),
+        hud_atlas,
+        glint,
+        glint_armor,
+        forcefield: pack.forcefield.clone(),
+        panorama,
+        prepared,
+        previous,
+        premade,
+        api,
+        translucent_batching,
+        wide_frame,
+        shader_pack,
+    })
+}
+
+/// What the world renderer's build leaves for the caller's thread once
+/// the renderer lands: the HUD takes the menu bundle's sprite animations
+/// and shaders (the atlas that holds them cannot follow the creation —
+/// its font cache is single-threaded), and the pack's glint atlas is
+/// prepared against the new renderer's device.
+fn finish_world_renderer(
+    renderer: &mut Renderer,
+    pack: &PackResources,
+    gui: &UiResources,
+    filtering: (i32, i32),
+) -> Result<()> {
+    let atlas = &gui.atlas;
+    renderer.hud.sprite_animations = atlas
+        .sprite_animations
+        .iter()
+        .map(|(rect, animation)| (*rect, animation.clone(), (usize::MAX, 0, 0)))
+        .collect();
+    renderer
+        .hud
+        .set_text_shader(&renderer.device, atlas.text_shader.as_deref());
+    pack.item_renderer
+        .prepare_glint_atlas(renderer.device.limits().max_texture_dimension_2d, filtering)?;
+    renderer.set_lines_shader(atlas.lines_shader.as_deref());
+    let cit_glints = pack.item_renderer.cit.as_ref().map(|c| &c.glint_textures);
+    renderer
+        .hud
+        .set_cit_glints(&renderer.device, &renderer.queue, cit_glints);
+    Ok(())
+}
+
 /// Kept out of its callers' frames: with the release profile's thin LTO
 /// and single codegen unit, inlining this build (and the handoff's other
 /// heavy steps) into `Loading::finish` fused them into one frame that
@@ -21371,88 +21564,20 @@ fn build_renderer_with_seed(
     shader_pack: bool,
     filtering: (i32, i32),
 ) -> Result<Box<Renderer>> {
-    let assets = &pack.render;
-    let atlas = &gui.atlas;
-    // The new renderer's atlas texture starts from `HudAtlas.pixels`, which
-    // holds the textures but never a glyph rasterized at run time. The font's
-    // cache still answers with the rects it drew into the previous renderer's
-    // texture, so forget them: the glyphs that are drawn again are placed into
-    // this texture (as `ui_theme` does when its atlas changes). Without this,
-    // Chinese and Japanese menu labels go blank when the loading screen hands
-    // over to the game.
-    atlas.font.reset_cache();
-    // Made here when the worker did not: the renderer's own fallback has no LabPBR maps.
-    let prepared = Some(prepared.unwrap_or_else(|| prepare_renderer_textures(pack)));
-    let atlas_pixels = atlas.pixels();
-    // The creation runs on another thread (see `create_renderer`), which the
-    // atlas cannot follow: its font cache is single-threaded. What the
-    // creation reads from it is plain pixels, taken out here.
-    let hud_atlas = (&atlas_pixels[..], atlas.width, atlas.height);
-    let glint = (&atlas.glint.0[..], atlas.glint.1, atlas.glint.2);
-    let glint_armor = (
-        &atlas.glint_armor.0[..],
-        atlas.glint_armor.1,
-        atlas.glint_armor.2,
-    );
-    // Likewise the panorama: the bundle cannot follow (same font cache, via
-    // its atlas), the faces are an `Arc`.
-    let panorama = gui.panorama.clone();
-    // The creation runs on another thread (see `create_renderer`): a
-    // surface it had to make there could not be made at all on iOS, so the
-    // window's surface is settled here, on the caller's thread — a seeded
-    // build takes its surface from the seed, prepared now if the seed
-    // holds none; a fresh build takes a premade instance and surface.
-    let mut previous = previous;
-    if let Some(seed) = &mut previous
-        && !offscreen
-    {
-        seed.prepare_surface(&window)?;
-    }
-    let premade = if previous.is_none() && !offscreen {
-        Some(horizon_client::gfx::premake_surface(&window, api)?)
-    } else {
-        None
-    };
-    let mut renderer = create_renderer(|| {
-        pollster::block_on(Renderer::new_with_seed(
-            window,
-            offscreen,
-            &assets.pixels.get(),
-            assets.sprite_size,
-            assets.sprite_minimum_size,
-            assets.texture_layers,
-            &assets.sprite_mips,
-            &assets.animations,
-            hud_atlas,
-            glint,
-            glint_armor,
-            (&pack.forcefield.2, pack.forcefield.0),
-            panorama,
-            prepared,
-            previous,
-            premade,
-            api,
-            translucent_batching,
-            wide_frame,
-            shader_pack,
-        ))
-        .map(Box::new)
-    })?;
-    renderer.hud.sprite_animations = atlas
-        .sprite_animations
-        .iter()
-        .map(|(rect, animation)| (*rect, animation.clone(), (usize::MAX, 0, 0)))
-        .collect();
-    renderer
-        .hud
-        .set_text_shader(&renderer.device, atlas.text_shader.as_deref());
-    pack.item_renderer
-        .prepare_glint_atlas(renderer.device.limits().max_texture_dimension_2d, filtering)?;
-    renderer.set_lines_shader(atlas.lines_shader.as_deref());
-    let cit_glints = pack.item_renderer.cit.as_ref().map(|c| &c.glint_textures);
-    renderer
-        .hud
-        .set_cit_glints(&renderer.device, &renderer.queue, cit_glints);
+    let build = prepare_world_renderer_build(
+        window,
+        offscreen,
+        pack,
+        gui,
+        previous,
+        prepared,
+        api,
+        translucent_batching,
+        wide_frame,
+        shader_pack,
+    )?;
+    let mut renderer = build.create()?;
+    finish_world_renderer(&mut renderer, pack, gui, filtering)?;
     Ok(renderer)
 }
 
@@ -21580,6 +21705,35 @@ fn spawn_loading_renderer(
         // A start that cannot spawn this thread cannot start at all; the
         // creation thread's own spawn is treated the same way.
         .expect("the loading renderer thread did not spawn");
+    receiver
+}
+
+/// Starts the world renderer's build (the startup handoff's) on a worker
+/// thread and returns the channel its result lands on: the handoff's
+/// counterpart to [`spawn_loading_renderer`]. The build used to run
+/// through `create_renderer`'s join on the event loop, which parked the
+/// main thread for the whole build (seconds); iOS's scene-update
+/// watchdog kills an app whose main thread stays unresponsive that long,
+/// before the menu ever appears. `Loading::poll_handoff` lands the
+/// result instead, and the loop keeps turning meanwhile. The build's
+/// surface was settled before this is called, on the event loop's thread
+/// ([`prepare_world_renderer_build`]): the worker never makes one — its
+/// part of the creation runs under `create_renderer` exactly as the
+/// joined build's did, one thread further out.
+fn spawn_world_renderer(
+    build: WorldRendererBuild,
+) -> Receiver<std::result::Result<Box<Renderer>, String>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("world-renderer".to_owned())
+        .spawn(move || {
+            let built = build.create();
+            // The loop may have gone away with the build: a failed send is fine.
+            let _ = sender.send(built.map_err(|e| e.to_string()));
+        })
+        // A start that cannot spawn this thread cannot start at all; the
+        // creation thread's own spawn is treated the same way.
+        .expect("the world renderer thread did not spawn");
     receiver
 }
 
@@ -21945,6 +22099,39 @@ struct PendingRenderer {
     step: Option<startup::Step>,
 }
 
+/// The startup handoff's first half, done: the world renderer is building
+/// on its worker (`spawn_world_renderer`), and this holds what the second
+/// half (`Loading::finish_handoff`) needs when the build lands — the
+/// options and menu bundle `finish` took out of the loading state, and
+/// the loader's bundle with its prepared textures already taken out into
+/// the build.
+struct PendingHandoff {
+    receiver: Receiver<std::result::Result<Box<Renderer>, String>>,
+    options: Options,
+    gui: UiResources,
+    window: Arc<Window>,
+    loaded: Loaded,
+    /// The settings' texture filtering, read when the build started: the
+    /// landed renderer's glint atlas is prepared with it
+    /// (`finish_world_renderer`).
+    filtering: (i32, i32),
+    handoff_at: Instant,
+    renderer_at: Instant,
+    step: Option<startup::Step>,
+}
+
+/// What `Loading::poll_handoff` reports to `App::about_to_wait`.
+enum HandoffPoll {
+    /// The world renderer is still building on its worker.
+    Building,
+    /// The handoff completed: the game, ready to swap in.
+    Ready(Box<split::Split<'static>>),
+    /// A harness or dedicated run finished inside `start_game`.
+    Done,
+    /// The build or the handoff itself failed.
+    Failed(Box<dyn std::error::Error>),
+}
+
 /// The loading screen's state while the worker loads the resources.
 struct Loading {
     local_performance: local_performance::LocalPerformance,
@@ -21959,6 +22146,11 @@ struct Loading {
     /// once the build lands, so the title build still starts from the
     /// landed renderer's seed (`set_ui`).
     queued_ui: Option<(UiResources, PathBuf)>,
+    /// The handoff's world renderer build running on its worker, if one
+    /// is: while it runs the handoff is neither complete nor startable
+    /// again, and the loading screen stays up (`Loading::poll_handoff`
+    /// lands the build).
+    handoff: Option<PendingHandoff>,
     /// The boot screen's atlas, until the pack's GUI atlas replaces it.
     boot: horizon_client::hud::HudAtlas,
     gui: Option<UiResources>,
@@ -21996,15 +22188,16 @@ struct Loading {
 /// world renderer anyway (a hidden window may never be asked to redraw).
 const TITLE_FRAME_WAIT: Duration = Duration::from_secs(1);
 impl Loading {
-    /// The world renderer is built on the main thread, so building it before
-    /// the title is on the screen holds the title back by that build. Wait for
-    /// one title frame first, unless a world is waiting to open. A renderer
-    /// build still running (or a menu bundle held for one) means the title
-    /// renderer is not the installed one: handing off would take the boot
-    /// renderer's seed, or none.
+    /// The handoff takes the title renderer's seed, so wait for one title
+    /// frame before starting it, unless a world is waiting to open. A
+    /// renderer build still running (or a menu bundle held for one) means
+    /// the title renderer is not the installed one: handing off would
+    /// take the boot renderer's seed, or none. A handoff already building
+    /// its world renderer is not startable again.
     fn ready_for_handoff(&self) -> bool {
         self.building.is_none()
             && self.queued_ui.is_none()
+            && self.handoff.is_none()
             && (self.title_drawn
                 || self.menu.pending.is_some()
                 || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT))
@@ -22383,7 +22576,16 @@ impl Loading {
         }
         self.redraw.drawn(Instant::now(), self.frame_period());
     }
-    fn finish(&mut self, loaded: Loaded) -> Result<Option<Box<split::Split<'static>>>> {
+    /// The resources are ready: start the handoff. This is its first
+    /// half — take the options, the menu bundle and the title renderer's
+    /// seed out of the loading state, settle the world renderer's
+    /// surface on this thread, and start its build on a worker
+    /// ([`spawn_world_renderer`]). The second half runs when the build
+    /// lands ([`Loading::poll_handoff`] → [`Loading::finish_handoff`]):
+    /// joining the build here instead parked the event loop for its
+    /// whole duration — seconds — which is what iOS's scene-update
+    /// watchdog kills an app for, before the menu ever appears.
+    fn finish(&mut self, loaded: Loaded) -> Result<()> {
         let handoff_at = Instant::now();
         let mut options = self.options.take().ok_or("loading already finished")?;
         options.resources = loaded.root.clone();
@@ -22394,13 +22596,83 @@ impl Loading {
         let window = self.window.clone().ok_or("window closed")?;
         // Keep the loader's device and swap in the real textures in one step.
         let previous = release_startup_renderer(&mut self.renderer);
-        self.finish_handoff(handoff_at, options, gui, window, previous, loaded)
+        let renderer_at = Instant::now();
+        let step = startup::step("renderer.world");
+        let mut loaded = loaded;
+        let build = prepare_world_renderer_build(
+            window.clone(),
+            options.offscreen,
+            &loaded.pack,
+            &gui,
+            previous,
+            loaded.renderer_cpu.take(),
+            self.settings.horizon.api,
+            self.settings.horizon.translucent_batching,
+            self.settings.horizon.wide_frame(),
+            shader_packs::picked_pack_draws_flat(&self.settings),
+        )?;
+        self.handoff = Some(PendingHandoff {
+            receiver: spawn_world_renderer(build),
+            options,
+            gui,
+            window,
+            loaded,
+            filtering: (
+                self.settings.file.int("textureFiltering"),
+                self.settings.file.int("maxAnisotropyBit"),
+            ),
+            handoff_at,
+            renderer_at,
+            step,
+        });
+        Ok(())
     }
 
-    /// The handoff itself: build the world renderer, construct the game,
-    /// hand the menu's state over. It runs on the event loop's thread —
-    /// the `Game` it makes is not `Send` (its attribute maps and tick
-    /// caches hold `Rc`s, its screens hold trait objects without `Send`
+    /// Lands the handoff's world renderer build, if it has: polled from
+    /// `App::about_to_wait` on the ticks after `finish` started it, so
+    /// the event loop keeps turning while the build runs — the loading
+    /// screen stays responsive, and the main thread never parks on the
+    /// build. When the build lands, the handoff's second half runs here,
+    /// on the event loop's thread.
+    fn poll_handoff(&mut self) -> HandoffPoll {
+        let Some(pending) = &self.handoff else {
+            return HandoffPoll::Building;
+        };
+        let result = match pending.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return HandoffPoll::Building,
+            // The worker died with the build (its panics rethrow there):
+            // the channel closed without a result.
+            Err(TryRecvError::Disconnected) => {
+                Err("the renderer build stopped without a result".to_owned())
+            }
+        };
+        let mut pending = self.handoff.take().expect("a handoff was just polled");
+        // The build's startup step ends here, with the build.
+        drop(pending.step.take());
+        let mut renderer = match result {
+            Ok(renderer) => renderer,
+            Err(message) => return HandoffPoll::Failed(message.into()),
+        };
+        if let Err(e) = finish_world_renderer(
+            &mut renderer,
+            &pending.loaded.pack,
+            &pending.gui,
+            pending.filtering,
+        ) {
+            return HandoffPoll::Failed(e);
+        }
+        match self.finish_handoff(pending, renderer) {
+            Ok(Some(split)) => HandoffPoll::Ready(split),
+            Ok(None) => HandoffPoll::Done,
+            Err(e) => HandoffPoll::Failed(e),
+        }
+    }
+
+    /// The handoff's second half, run from [`Loading::poll_handoff`] once
+    /// the world renderer lands: construct the game, hand the menu's
+    /// state over. It runs on the event loop's thread — the `Game` it
+    /// makes is not `Send` (its attribute maps and tick caches hold `Rc`s, its screens hold trait objects without `Send`
     /// bounds), so unlike renderer creation it cannot be built on another
     /// thread and brought back. Keeping it inside the iOS main thread's
     /// ~1 MB stack took two steps. First, frames: with the release
@@ -22421,38 +22693,25 @@ impl Loading {
     /// (`build_renderer_with_seed`), `start_game` boxes the game at its
     /// tail, and `Split::new_boxed` builds the split in its box from the
     /// boxed game — this frame, and `finish`'s, hold pointers. The
-    /// renderer's heavy interior still runs on the creation thread
-    /// (`create_renderer`), and its surface is settled on this thread
-    /// inside `build_renderer_with_seed`, as before.
+    /// renderer's heavy interior runs on the creation thread
+    /// (`create_renderer`), under the build `finish` started; its
+    /// surface was settled on this thread before that build started, as
+    /// before.
     #[inline(never)]
     fn finish_handoff(
         &mut self,
-        handoff_at: Instant,
-        options: Options,
-        gui: UiResources,
-        window: Arc<Window>,
-        previous: Option<horizon_client::gfx::RendererSeed>,
-        loaded: Loaded,
+        pending: PendingHandoff,
+        renderer: Box<Renderer>,
     ) -> Result<Option<Box<split::Split<'static>>>> {
-        let renderer_at = Instant::now();
-        let renderer = startup::time("renderer.world", || {
-            build_renderer_with_seed(
-                window.clone(),
-                options.offscreen,
-                &loaded.pack,
-                &gui,
-                previous,
-                loaded.renderer_cpu,
-                self.settings.horizon.api,
-                self.settings.horizon.translucent_batching,
-                self.settings.horizon.wide_frame(),
-                shader_packs::picked_pack_draws_flat(&self.settings),
-                (
-                    self.settings.file.int("textureFiltering"),
-                    self.settings.file.int("maxAnisotropyBit"),
-                ),
-            )
-        })?;
+        let PendingHandoff {
+            options,
+            gui,
+            window,
+            loaded,
+            handoff_at,
+            renderer_at,
+            ..
+        } = pending;
         log::info!(
             "Horizon: world renderer ready after {} ms",
             self.started.elapsed().as_millis()
@@ -22565,18 +22824,33 @@ impl ApplicationHandler for App {
                 if loading.suspended {
                     return;
                 }
-                match if loading.menu.reload_packs || !loading.ready_for_handoff() {
-                    None
+                // While the handoff's world renderer builds on its
+                // worker, the loop keeps turning (a joined build parks
+                // the main thread past iOS's scene-update watchdog);
+                // the handoff completes on the tick the build lands.
+                if loading.handoff.is_some() {
+                    match loading.poll_handoff() {
+                        HandoffPoll::Building => Step::Waiting,
+                        HandoffPoll::Ready(game) => Step::Ready(game),
+                        HandoffPoll::Done => Step::Done,
+                        HandoffPoll::Failed(e) => Step::Failed(e),
+                    }
                 } else {
-                    loading.loaded.take()
-                } {
-                    None => Step::Waiting,
-                    Some(Err(e)) => Step::Failed(e.into()),
-                    Some(Ok(loaded)) => match loading.finish(loaded) {
-                        Ok(Some(game)) => Step::Ready(game),
-                        Ok(None) => Step::Done,
-                        Err(e) => Step::Failed(e),
-                    },
+                    match if loading.menu.reload_packs || !loading.ready_for_handoff() {
+                        None
+                    } else {
+                        loading.loaded.take()
+                    } {
+                        None => Step::Waiting,
+                        Some(Err(e)) => Step::Failed(e.into()),
+                        // Starting the handoff only starts its renderer
+                        // build: the game arrives through `poll_handoff`
+                        // when the build lands.
+                        Some(Ok(loaded)) => match loading.finish(loaded) {
+                            Ok(()) => Step::Waiting,
+                            Err(e) => Step::Failed(e),
+                        },
+                    }
                 }
             }
         };
@@ -22656,6 +22930,7 @@ fn run_loading(
         renderer: None,
         building: None,
         queued_ui: None,
+        handoff: None,
         boot: horizon_client::hud::HudAtlas::boot(),
         gui: None,
         settings,
