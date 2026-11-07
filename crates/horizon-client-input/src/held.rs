@@ -12,6 +12,8 @@ pub enum Source {
     /// The keyboard and mouse, and the scripting socket acting as them.
     Keyboard,
     Pad,
+    /// The on-screen touch HUD, independent of physical controllers.
+    Touch,
 }
 
 impl Source {
@@ -19,6 +21,7 @@ impl Source {
         match self {
             Source::Keyboard => 1,
             Source::Pad => 2,
+            Source::Touch => 4,
         }
     }
 }
@@ -136,6 +139,28 @@ mod tests {
         assert!(keys.held_by(&KeyCode::Space, Source::Pad));
         assert!(!keys.held_by(&KeyCode::Space, Source::Keyboard));
         assert!(keys.release(&KeyCode::Space, Source::Pad));
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn touch_release_does_not_release_keyboard_or_controller_holds() {
+        let mut keys = HeldKeys::default();
+        keys.press(KeyCode::Space, Source::Keyboard);
+        keys.press(KeyCode::Space, Source::Pad);
+        keys.press(KeyCode::Space, Source::Touch);
+        keys.press(KeyCode::ControlLeft, Source::Pad);
+        keys.press(KeyCode::ControlLeft, Source::Touch);
+        keys.press(KeyCode::ShiftLeft, Source::Touch);
+
+        assert_eq!(keys.release_source(Source::Touch), vec![KeyCode::ShiftLeft]);
+        assert!(keys.held_by(&KeyCode::Space, Source::Keyboard));
+        assert!(keys.held_by(&KeyCode::Space, Source::Pad));
+        assert!(!keys.held_by(&KeyCode::Space, Source::Touch));
+        assert!(keys.held_by(&KeyCode::ControlLeft, Source::Pad));
+        assert!(!keys.release(&KeyCode::Space, Source::Keyboard));
+        assert!(keys.contains(&KeyCode::Space));
+        assert!(keys.release(&KeyCode::Space, Source::Pad));
+        assert!(keys.release(&KeyCode::ControlLeft, Source::Pad));
         assert!(keys.is_empty());
     }
 
