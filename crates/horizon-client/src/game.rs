@@ -21427,69 +21427,93 @@ fn release_startup_renderer(
     })
 }
 
-/// The loading screen's renderer: one atlas (the boot screen's until the
+/// Starts the loading screen's renderer on a worker thread and returns the
+/// channel its result lands on: one atlas (the boot screen's until the
 /// pack's GUI atlas is ready) over one opaque white block-sprite layer, an
-/// empty border texture and the title panorama once the menu bundle is ready.
-fn loading_renderer(
+/// empty border texture and the title panorama once the menu bundle is
+/// ready.
+///
+/// The build used to run on the event-loop thread (through
+/// [`create_renderer`]'s join), which deadlocked the phone start: part of
+/// building a renderer waits on the main thread's run loop, and the join
+/// starved it. Callers poll the channel from `about_to_wait` instead
+/// (`Loading::poll_renderer`) and keep turning meanwhile. What the build
+/// reads is taken out of the atlas here, on the caller's thread: borrowed
+/// pixels cannot follow it onto the worker, so they cross as owned copies.
+fn spawn_loading_renderer(
     window: Arc<Window>,
     offscreen: bool,
     atlas: Option<&horizon_client::hud::HudAtlas>,
     panorama: Option<&Arc<horizon_client::gfx::panorama::Faces>>,
     previous: Option<horizon_client::gfx::RendererSeed>,
     api: horizon_client::graphics::GraphicsApi,
-) -> Result<Renderer> {
-    static FORCEFIELD: [u8; 4] = [0; 4];
+) -> Receiver<std::result::Result<Renderer, String>> {
     static EMPTY_HUD: [u8; 4] = [0, 0, 0, 255];
     static EMPTY_GLINT: [u8; 4] = [0; 4];
     let panorama = panorama
         .cloned()
         .unwrap_or_else(|| Arc::new(horizon_client::gfx::panorama::Faces::colour([0; 4])));
-    let (pixels, width, height) = atlas.map_or((EMPTY_HUD.as_slice(), 1, 1), |a| {
-        (a.pixels.as_slice(), a.width, a.height)
+    let (pixels, width, height) = atlas.map_or((EMPTY_HUD.to_vec(), 1, 1), |a| {
+        (a.pixels.clone(), a.width, a.height)
     });
     let (glint_pixels, glint_width, glint_height) = atlas
-        .map_or((EMPTY_GLINT.as_slice(), 1, 1), |a| {
-            (a.glint.0.as_slice(), a.glint.1, a.glint.2)
+        .map_or((EMPTY_GLINT.to_vec(), 1, 1), |a| {
+            (a.glint.0.clone(), a.glint.1, a.glint.2)
         });
+    // The sprite animations ride along as data for the same reason; the
+    // finished renderer gets them on the worker, as the inline build's did.
+    let animations = atlas.map_or_else(Vec::new, |a| {
+        a.sprite_animations
+            .iter()
+            .map(|(rect, animation)| (*rect, animation.clone(), (usize::MAX, 0, 0)))
+            .collect()
+    });
     // A glyph rasterized into an earlier texture is not in these pixels; the
     // new texture gets it again when the character is drawn (see
     // `build_renderer`).
     if let Some(atlas) = atlas {
         atlas.font.reset_cache();
     }
-    let mut renderer = create_renderer(|| {
-        pollster::block_on(Renderer::new_with_seed(
-            window,
-            offscreen,
-            &[255, 255, 255, 255],
-            1,
-            1,
-            1,
-            &[],
-            &[],
-            (pixels, width, height),
-            (glint_pixels, glint_width, glint_height),
-            (glint_pixels, glint_width, glint_height),
-            (&FORCEFIELD[..], 1),
-            panorama,
-            None,
-            previous,
-            api,
-            // It draws no terrain.
-            false,
-            // An 8-bit frame, which HDR output takes as well.
-            false,
-            false,
-        ))
-    })?;
-    if let Some(atlas) = atlas {
-        renderer.hud.sprite_animations = atlas
-            .sprite_animations
-            .iter()
-            .map(|(rect, animation)| (*rect, animation.clone(), (usize::MAX, 0, 0)))
-            .collect();
-    }
-    Ok(renderer)
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("loading-renderer".to_owned())
+        .spawn(move || {
+            let built = create_renderer(|| {
+                pollster::block_on(Renderer::new_with_seed(
+                    window,
+                    offscreen,
+                    &[255, 255, 255, 255],
+                    1,
+                    1,
+                    1,
+                    &[],
+                    &[],
+                    (&pixels[..], width, height),
+                    (&glint_pixels[..], glint_width, glint_height),
+                    (&glint_pixels[..], glint_width, glint_height),
+                    (&[0; 4][..], 1),
+                    panorama,
+                    None,
+                    previous,
+                    api,
+                    // It draws no terrain.
+                    false,
+                    // An 8-bit frame, which HDR output takes as well.
+                    false,
+                    false,
+                ))
+            });
+            let built = built.map(|mut renderer| {
+                renderer.hud.sprite_animations = animations;
+                renderer
+            });
+            // The loop may have gone away with the build: a failed send is fine.
+            let _ = sender.send(built.map_err(|e| e.to_string()));
+        })
+        // A start that cannot spawn this thread cannot start at all; the
+        // creation thread's own spawn is treated the same way.
+        .expect("the loading renderer thread did not spawn");
+    receiver
 }
 
 /// A title-shaped frame: black clear and panorama, only the HUD is drawn.
@@ -21836,12 +21860,32 @@ fn performance_details(
     })
 }
 
+/// A loading-screen renderer building on its worker thread
+/// (`spawn_loading_renderer`): the finished build arrives on the channel,
+/// and `Loading::poll_renderer` installs it. The startup step the build
+/// belongs to ends when the build lands, not when it starts.
+struct PendingRenderer {
+    receiver: Receiver<std::result::Result<Renderer, String>>,
+    /// The title artwork rebuild (`set_ui`), as opposed to the boot
+    /// screen's first build: landing it starts the title frame's wait.
+    title: bool,
+    step: Option<startup::Step>,
+}
+
 /// The loading screen's state while the worker loads the resources.
 struct Loading {
     local_performance: local_performance::LocalPerformance,
     redraw: loading_schedule::LoadingSchedule,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// The renderer build running off the event loop, if one is: while it
+    /// runs there is no renderer to draw or hand off, and no second build
+    /// may start.
+    building: Option<PendingRenderer>,
+    /// A menu bundle that arrived while a build was running: processed
+    /// once the build lands, so the title build still starts from the
+    /// landed renderer's seed (`set_ui`).
+    queued_ui: Option<(UiResources, PathBuf)>,
     /// The boot screen's atlas, until the pack's GUI atlas replaces it.
     boot: horizon_client::hud::HudAtlas,
     gui: Option<UiResources>,
@@ -21870,6 +21914,10 @@ struct Loading {
     title_drawn: bool,
     menu: startup_menu::StartupMenu,
     error: Option<Box<dyn std::error::Error>>,
+    /// Stops the GDI boot paint once the boot build lands: the paint is
+    /// what the window shows until the first wgpu frame can present.
+    #[cfg(target_os = "windows")]
+    boot_paint: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 /// How long the handoff waits for the first title frame before building the
 /// world renderer anyway (a hidden window may never be asked to redraw).
@@ -21877,11 +21925,16 @@ const TITLE_FRAME_WAIT: Duration = Duration::from_secs(1);
 impl Loading {
     /// The world renderer is built on the main thread, so building it before
     /// the title is on the screen holds the title back by that build. Wait for
-    /// one title frame first, unless a world is waiting to open.
+    /// one title frame first, unless a world is waiting to open. A renderer
+    /// build still running (or a menu bundle held for one) means the title
+    /// renderer is not the installed one: handing off would take the boot
+    /// renderer's seed, or none.
     fn ready_for_handoff(&self) -> bool {
-        self.title_drawn
-            || self.menu.pending.is_some()
-            || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT)
+        self.building.is_none()
+            && self.queued_ui.is_none()
+            && (self.title_drawn
+                || self.menu.pending.is_some()
+                || self.ui_at.is_none_or(|at| at.elapsed() >= TITLE_FRAME_WAIT))
     }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.redraw.reset();
@@ -21944,53 +21997,43 @@ impl Loading {
         // until the first frame presents, so paint the boot screen on it and
         // keep repainting it as the console's lines arrive; the wgpu frames
         // redraw the same design when they start. GDI is unsafe:
-        // horizon-threads holds it (this crate forbids unsafe code).
+        // horizon-threads holds it (this crate forbids unsafe code). The
+        // paint stops when the boot build lands (`poll_renderer`).
         #[cfg(target_os = "windows")]
-        let boot_paint_stop = hwnd(&window).map(|hwnd| {
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let repaint_stop = stop.clone();
-            std::thread::spawn(move || {
-                while !repaint_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    horizon_threads::boot_paint::paint(
-                        hwnd,
-                        horizon_theme::fonts::GEIST_SEMIBOLD,
-                        horizon_theme::fonts::GEIST_MONO,
-                        &horizon_client::logging::recent_lines(),
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                }
+        {
+            self.boot_paint = hwnd(&window).map(|hwnd| {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let repaint_stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !repaint_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        horizon_threads::boot_paint::paint(
+                            hwnd,
+                            horizon_theme::fonts::GEIST_SEMIBOLD,
+                            horizon_theme::fonts::GEIST_MONO,
+                            &horizon_client::logging::recent_lines(),
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                    }
+                });
+                stop
             });
-            stop
-        });
+        }
         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
-        let boot_step = startup::step("renderer.boot");
-        match loading_renderer(
-            window.clone(),
-            offscreen,
-            Some(&self.boot),
-            None,
-            None,
-            self.settings.horizon.api,
-        ) {
-            Ok(r) => self.renderer = Some(r),
-            Err(e) => {
-                #[cfg(target_os = "windows")]
-                if let Some(stop) = &boot_paint_stop {
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                self.error = Some(e);
-                event_loop.exit();
-                return;
-            }
-        }
-        drop(boot_step);
-        // The wgpu frames take the window over: stop the boot paint thread
-        // before the first one presents.
-        #[cfg(target_os = "windows")]
-        if let Some(stop) = &boot_paint_stop {
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
+        // The build runs on a worker (`spawn_loading_renderer`) and
+        // `poll_renderer` installs it when it lands; until then the window
+        // sits unpainted, as it did while the inline build ran.
+        self.building = Some(PendingRenderer {
+            receiver: spawn_loading_renderer(
+                window.clone(),
+                offscreen,
+                Some(&self.boot),
+                None,
+                None,
+                self.settings.horizon.api,
+            ),
+            title: false,
+            step: startup::step("renderer.boot"),
+        });
         self.window = Some(window);
     }
     /// The window's surface is going away (a phone app in the background): let go of it now,
@@ -22028,6 +22071,18 @@ impl Loading {
     /// The menu bundle arrived: rebuild the loading screen with the real atlas
     /// and title panorama.
     fn set_ui(&mut self, gui: UiResources, root: PathBuf) {
+        // A renderer build is still running: the title build must start
+        // from the landed renderer's seed, so hold the bundle until it
+        // lands (`poll_renderer` runs it then). A bundle already held is
+        // superseded — only the newest artwork is worth building.
+        if self.building.is_some() {
+            self.queued_ui = Some((gui, root));
+            return;
+        }
+        self.set_ui_now(gui, root);
+    }
+
+    fn set_ui_now(&mut self, gui: UiResources, root: PathBuf) {
         log::info!(
             "Horizon: loading the title artwork after {} ms",
             self.started.elapsed().as_millis()
@@ -22043,24 +22098,70 @@ impl Loading {
         let offscreen = self.options.as_ref().is_some_and(|o| o.offscreen);
         let previous = release_startup_renderer(&mut self.renderer);
         let bundle = self.gui.as_ref().expect("the menu bundle was just set");
-        let _step = startup::step("renderer.title_artwork");
-        match loading_renderer(
-            window,
-            offscreen,
-            Some(&bundle.atlas),
-            Some(&bundle.panorama),
-            previous,
-            self.settings.horizon.api,
-        ) {
-            Ok(r) => {
-                horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
-                self.renderer = Some(r);
+        // The build runs on a worker (`spawn_loading_renderer`);
+        // `poll_renderer` installs it, and the title frame's wait starts
+        // when it lands.
+        self.building = Some(PendingRenderer {
+            receiver: spawn_loading_renderer(
+                window,
+                offscreen,
+                Some(&bundle.atlas),
+                Some(&bundle.panorama),
+                previous,
+                self.settings.horizon.api,
+            ),
+            title: true,
+            step: startup::step("renderer.title_artwork"),
+        });
+    }
+    /// Lands a renderer build that finished on its worker, if it has:
+    /// `about_to_wait` polls rather than the start sites joining the build,
+    /// so the event loop keeps turning while one runs (on iOS part of a
+    /// build waits on the main thread's run loop).
+    fn poll_renderer(&mut self) {
+        let Some(building) = &self.building else {
+            return;
+        };
+        let result = match building.receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            // The worker died with the build (its panics rethrow there):
+            // the channel closed without a result.
+            Err(TryRecvError::Disconnected) => {
+                Err("the renderer build stopped without a result".to_owned())
             }
-            Err(e) => self.error = Some(e),
+        };
+        let building = self.building.take().expect("a build was just polled");
+        // The wgpu frames take the window over once the boot renderer
+        // lands: stop the GDI boot paint, whichever way the build went.
+        #[cfg(target_os = "windows")]
+        if !building.title
+            && let Some(stop) = &self.boot_paint
+        {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        // The title frame's wait starts once its renderer is built.
-        self.ui_at = Some(Instant::now());
-        self.redraw.reset();
+        // The build's startup step ends here, with the build.
+        drop(building.step);
+        match result {
+            Ok(renderer) => {
+                horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
+                if building.title {
+                    // The title frame's wait starts once its renderer is built.
+                    self.ui_at = Some(Instant::now());
+                    self.redraw.reset();
+                }
+                self.renderer = Some(renderer);
+            }
+            Err(message) => {
+                self.error = Some(message.into());
+                return;
+            }
+        }
+        // A bundle held back by this build runs now: its title build
+        // starts from the renderer that just landed.
+        if let Some((gui, root)) = self.queued_ui.take() {
+            self.set_ui_now(gui, root);
+        }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if horizon_client::platform::exit_requested() {
@@ -22072,6 +22173,9 @@ impl Loading {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
+        // Land a finished renderer build before anything that draws,
+        // hands off, or reports the build's error.
+        self.poll_renderer();
         // The loop may run once more after exit(): keep the first error, the
         // one that ended loading.
         if self.error.is_some() {
@@ -22422,6 +22526,8 @@ fn run_loading(
         redraw: Default::default(),
         window: None,
         renderer: None,
+        building: None,
+        queued_ui: None,
         boot: horizon_client::hud::HudAtlas::boot(),
         gui: None,
         settings,
@@ -22443,6 +22549,8 @@ fn run_loading(
         title_drawn: false,
         menu,
         error: None,
+        #[cfg(target_os = "windows")]
+        boot_paint: None,
     };
     let mut app = App::Loading(Box::new(loading));
     let result = horizon_client::winit_host::event_loop()?.run_app(&mut app);
