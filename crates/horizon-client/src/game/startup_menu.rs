@@ -1323,6 +1323,8 @@ mod tests {
             redraw: Default::default(),
             window: None,
             renderer: None,
+            building: None,
+            queued_ui: None,
             boot: horizon_client::hud::HudAtlas::boot(),
             gui: None,
             settings: Settings::default(),
@@ -1344,6 +1346,8 @@ mod tests {
             title_drawn: false,
             menu: StartupMenu::default(),
             error: None,
+            #[cfg(target_os = "windows")]
+            boot_paint: None,
         }
     }
 
