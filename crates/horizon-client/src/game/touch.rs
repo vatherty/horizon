@@ -28,6 +28,9 @@ use winit::{
 /// The touch controls' state in the game.
 pub(super) struct TouchState {
     controls: TouchControls,
+    /// The layout from `horizon-touch.txt` before the Touch options are
+    /// applied over it (they scale its look gain and button size).
+    base_layout: Layout,
     enabled: bool,
     /// Seconds are counted from here.
     since: Instant,
@@ -39,14 +42,16 @@ pub(super) struct TouchState {
 
 impl Default for TouchState {
     fn default() -> Self {
+        // `horizon-touch.txt` in the game folder (the working directory) tunes it.
+        let base_layout = std::env::current_dir()
+            .map(|dir| Layout::load(&dir))
+            .unwrap_or_default();
         Self {
             controls: TouchControls::new(
-                // `horizon-touch.txt` in the game folder (the working directory) tunes it.
-                std::env::current_dir()
-                    .map(|dir| Layout::load(&dir))
-                    .unwrap_or_default(),
+                base_layout.clone(),
                 controls::Screen::plain(1280.0, 720.0, 1.0),
             ),
+            base_layout,
             enabled: cfg!(any(target_os = "android", target_os = "ios"))
                 || std::env::var("HORIZON_TOUCH").is_ok_and(|v| v == "1"),
             since: Instant::now(),
@@ -54,6 +59,55 @@ impl Default for TouchState {
             swallowing: false,
         }
     }
+}
+
+/// The window's safe-area insets in physical pixels, for the touch controls
+/// to keep off the unsafe edges. Only iOS has any: winit exposes no safe-area
+/// call, but its iOS backend defines the window's inner position and size
+/// from the safe area, so the insets are what the full surface extends past
+/// them on each side. If the platform reports nothing sane, landscape
+/// iPhones keep fixed insets instead (24 dp at the sides, 16 dp below).
+#[cfg(target_os = "ios")]
+fn safe_insets(
+    window: Option<&winit::window::Window>,
+    width: f32,
+    height: f32,
+    density: f32,
+) -> controls::Insets {
+    if let Some(window) = window
+        && let Ok(position) = window.inner_position()
+    {
+        let inner = window.inner_size();
+        let insets = controls::Insets {
+            left: (position.x as f32).max(0.0),
+            top: (position.y as f32).max(0.0),
+            right: (width - position.x as f32 - inner.width as f32).max(0.0),
+            bottom: (height - position.y as f32 - inner.height as f32).max(0.0),
+        };
+        // A sane safe area never eats half the screen; anything wider is
+        // the platform reporting positions, not insets.
+        if insets.left + insets.right < width / 2.0 && insets.top + insets.bottom < height / 2.0 {
+            return insets;
+        }
+    }
+    controls::Insets {
+        left: 24.0 * density,
+        top: 0.0,
+        right: 24.0 * density,
+        bottom: 16.0 * density,
+    }
+}
+
+/// No platform but iOS reports a safe area to winit (Android's edges are
+/// the layout's own margin's problem, as before).
+#[cfg(not(target_os = "ios"))]
+fn safe_insets(
+    _window: Option<&winit::window::Window>,
+    _width: f32,
+    _height: f32,
+    _density: f32,
+) -> controls::Insets {
+    controls::Insets::default()
 }
 
 /// A finger as the mouse: the events a pointer at its place and a left button would send. The
@@ -137,8 +191,25 @@ impl Game<'_> {
                     h: 22.0 * s,
                 },
                 slot: 20.0 * s,
+                insets: safe_insets(self.window.as_deref(), width as f32, height as f32, density),
             });
         }
+        // The Touch options (under Mouse Settings) ride on the layout file's
+        // values: they scale its look gain and button size, and switch world
+        // taps and holds, so a change in the options applies at once.
+        let mut layout = self.touch.base_layout.clone();
+        layout.look_gain =
+            (layout.look_gain * self.settings.touch_look_multiplier()).clamp(0.2, 8.0);
+        layout.button_fraction =
+            (layout.button_fraction * self.settings.touch_button_scale()).clamp(0.05, 0.4);
+        if *self.touch.controls.layout() != layout {
+            self.touch.controls.set_layout(layout);
+        }
+        let released = self
+            .touch
+            .controls
+            .set_world_touch(self.settings.touch_world_interact);
+        self.touch_actions(event_loop, released);
         let actions = self.touch.controls.set_mode(self.touch_mode());
         self.touch_actions(event_loop, actions);
     }
