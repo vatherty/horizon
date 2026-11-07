@@ -28,19 +28,21 @@
 	<array>
 		<string>arm64</string>
 	</array>
-	<!-- The game is landscape-first; the launcher is usable in any orientation.
-	     The game sets its own orientations through winit once the mobile layer
-	     lands. -->
+	<!-- Landscape only (set in project.yml, which generates this file):
+	     with portrait allowed the app started in portrait and a turn to
+	     landscape handed the game a window resize mid-start. -->
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
-		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~iphone</key>
+	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
-		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
