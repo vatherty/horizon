@@ -71,17 +71,6 @@ fn turned_away(game: &Game<'_>) -> Option<String> {
     })
 }
 
-/// The `Game` `start` makes (~67 KB, by value) into a box, in a frame of its own that is gone
-/// once it is: the copies stay out of the caller's frame, deep in the event loop.
-#[inline(never)]
-fn boxed(start: impl FnOnce() -> Result<Option<Game<'static>>>) -> Result<Box<Game<'static>>> {
-    match start() {
-        Ok(Some(game)) => Ok(Box::new(game)),
-        Ok(None) => Err("the player's game did not start".into()),
-        Err(e) => Err(e),
-    }
-}
-
 /// P1's server lets a splitscreen player in (#6399: everyone who plays elsewhere owns the
 /// game): `account`, its launcher Microsoft session (whether that has expired), else an offline
 /// profile, `unavailable` when that name is a launcher account that couldn't be handed over.
@@ -419,9 +408,10 @@ impl Split<'_> {
         game.ui.options.split_profiles.refused = Some(why);
     }
 
-    /// A new player's game in its seat. Boxed as it comes out of `start_game`, and never
-    /// inlined: a `Game` is ~67 KB, and copies of it in the event loop's frames overflowed
-    /// Windows' 1 MB main stack.
+    /// A new player's game in its seat. `start_game` boxes the game as it
+    /// comes out, and this is never inlined: a `Game` is ~67 KB, and
+    /// copies of it in the event loop's frames overflowed Windows' 1 MB
+    /// main stack.
     #[inline(never)]
     fn start_guest(
         &mut self,
@@ -460,21 +450,20 @@ impl Split<'_> {
         let window = host.window.clone().ok_or("no window")?;
         let pack = host.pack.clone();
         let resources = host.options.resources.clone();
-        let mut guest = boxed(|| {
-            start_game(
-                res,
-                pack,
-                gui,
-                options,
-                None,
-                audio,
-                resources,
-                Instant::now(),
-                None,
-                Some(settings),
-                None,
-            )
-        })?;
+        let mut guest = start_game(
+            res,
+            pack,
+            gui,
+            options,
+            None,
+            audio,
+            resources,
+            Instant::now(),
+            None,
+            Some(settings),
+            None,
+        )?
+        .ok_or("the player's game did not start")?;
         guest.renderer = Some(build_renderer(
             window.clone(),
             true,
