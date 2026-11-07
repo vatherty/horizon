@@ -9,6 +9,8 @@ use winit::event::MouseButton;
 struct Missing {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    /// The renderer building on its worker thread, until it lands.
+    building: Option<std::sync::mpsc::Receiver<std::result::Result<Renderer, String>>>,
     gui: UiResources,
     screen: NoResources,
     /// The pointer in physical pixels.
@@ -22,6 +24,7 @@ pub(super) fn show(looked_in: &std::path::Path, settings: &Settings) -> Result<(
     let mut app = Missing {
         window: None,
         renderer: None,
+        building: None,
         gui: UiResources {
             atlas: HudAtlas::build(looked_in)?,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces::colour([0; 4])),
@@ -97,32 +100,26 @@ impl ApplicationHandler for Missing {
             .with_title("Horizon")
             .with_window_icon(horizon_client::window::icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1040.0, 700.0));
-        let made = event_loop
-            .create_window(attributes)
-            .map_err(Into::into)
-            .and_then(|window| {
-                let window = Arc::new(window);
-                let renderer = loading_renderer(
-                    window.clone(),
-                    false,
-                    Some(&self.gui.atlas),
-                    Some(&self.gui.panorama),
-                    None,
-                    self.api,
-                )?;
-                Ok((window, renderer))
-            });
-        match made {
-            Ok((window, renderer)) => {
-                window.request_redraw();
-                self.window = Some(window);
-                self.renderer = Some(renderer);
-            }
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
             Err(e) => {
-                self.error = Some(e);
+                self.error = Some(e.into());
                 event_loop.exit();
+                return;
             }
-        }
+        };
+        // The renderer builds on a worker, as the loading screen's does:
+        // this loop must not join a build either (`about_to_wait` polls
+        // for the result).
+        self.building = Some(spawn_loading_renderer(
+            window.clone(),
+            false,
+            Some(&self.gui.atlas),
+            Some(&self.gui.panorama),
+            None,
+            self.api,
+        ));
+        self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -161,6 +158,30 @@ impl ApplicationHandler for Missing {
         if horizon_threads::stop_requests() > 0 {
             event_loop.exit();
             return;
+        }
+        if let Some(building) = &self.building {
+            match building.try_recv() {
+                Ok(Ok(renderer)) => {
+                    self.building = None;
+                    self.renderer = Some(renderer);
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                Ok(Err(message)) => {
+                    self.error = Some(message.into());
+                    event_loop.exit();
+                    return;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                // The worker died with the build: the channel closed
+                // without a result.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.error = Some("the renderer build stopped without a result".into());
+                    event_loop.exit();
+                    return;
+                }
+            }
         }
         // Wake now and then for Ctrl+C in the console; redraws come with events.
         event_loop.set_control_flow(ControlFlow::WaitUntil(
