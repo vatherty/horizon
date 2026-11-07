@@ -28,6 +28,17 @@ targets:
       properties:
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
+        # Landscape only, for the same reason as the Files keys above: the
+        # generated plist's defaults include portrait, and with portrait
+        # allowed the app starts in portrait and a turn to landscape hands
+        # the game a window resize mid-start. Locked to landscape, the app
+        # starts in landscape and no rotation resize is ever delivered.
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations_iPhone:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.horizon.ios
