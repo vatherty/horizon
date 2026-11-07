@@ -1064,6 +1064,23 @@ pub struct RendererSeed {
     present_mode: wgpu::PresentMode,
 }
 
+impl RendererSeed {
+    /// Make the replacement renderer's surface on this thread, if the seed
+    /// does not already hold one (`release_surface` sets the old renderer's
+    /// aside; without one, `new_with_seed` makes a surface itself, on
+    /// whatever thread the build runs). A build handed to another thread —
+    /// the loading screen's worker, the creation-stack helper — cannot
+    /// make one on iOS, where a surface created off the main thread has no
+    /// underlying handle to take, so a caller handing the seed over
+    /// prepares the surface first, on the thread that owns the window.
+    pub fn prepare_surface(&mut self, window: &Arc<Window>) -> Result<()> {
+        if self.spare_surface.is_none() {
+            self.spare_surface = Some(self.instance.create_surface(window.clone())?);
+        }
+        Ok(())
+    }
+}
+
 pub struct Renderer {
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
@@ -2063,6 +2080,49 @@ fn frame_format(
     }
 }
 
+/// An instance and the surface it made for a window, created ahead of a
+/// renderer's build (`premake_surface`) so the build itself can run on a
+/// worker thread: on iOS a surface created off the main thread has no
+/// underlying handle to take ("the underlying handle is not available"),
+/// so the pair is made on the thread that owns the window and crosses to
+/// the build, which does everything else — adapter, device, pipelines —
+/// wherever it runs.
+pub struct PremadeSurface {
+    /// The backends the instance was made for: the first ones
+    /// `open_device` tries. `open_backend` takes the pair only for its own
+    /// try at those backends; any other try makes its own, as before.
+    backends: wgpu::Backends,
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+}
+
+/// Make the instance and the window's surface on this thread, for a
+/// renderer build that will run on another one (`Renderer::new_with_seed`
+/// takes the pair as its `premade`). The instance is the one
+/// `open_device`'s first try would make, so the build uses this pair
+/// instead of making its own on the worker.
+pub fn premake_surface(window: &Arc<Window>, api: GraphicsApi) -> Result<PremadeSurface> {
+    let backends = device_search(
+        api.with_env(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::var_os("WGPU_BACKEND").is_some(),
+    )
+    .into_iter()
+    .next()
+    .and_then(|(order, _)| order.into_iter().next())
+    .unwrap_or_default();
+    let instance = wgpu::Instance::new(instance_descriptor(backends, Some(window), false));
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|e| format!("{} surface: {e}", backends_name(backends)))?;
+    Ok(PremadeSurface {
+        backends,
+        instance,
+        surface,
+    })
+}
+
 /// Opens a device on the first of `backend_order`'s backends that gives one.
 /// Offscreen rendering needs no surface, so it can use a GPU the window's
 /// display cannot present from (a headless compositor).
@@ -2071,16 +2131,18 @@ async fn open_device(
     offscreen: bool,
     api: GraphicsApi,
     layers: u32,
+    premade: Option<PremadeSurface>,
 ) -> Result<Opened> {
     let wgpu_backend = std::env::var_os("WGPU_BACKEND").is_some();
     let mut first = None;
+    let mut premade = premade;
     for (order, allow_cpu) in device_search(
         api.with_env(),
         std::env::consts::OS,
         std::env::consts::ARCH,
         wgpu_backend,
     ) {
-        match open_device_with(window, offscreen, &order, layers, allow_cpu).await {
+        match open_device_with(window, offscreen, &order, layers, allow_cpu, premade.take()).await {
             Ok(opened) => {
                 if let Some(first) = &first {
                     log::warn!(
@@ -2135,14 +2197,25 @@ async fn open_device_with(
     order: &[wgpu::Backends],
     layers: u32,
     allow_cpu: bool,
+    premade: Option<PremadeSurface>,
 ) -> Result<Opened> {
     let mut failures = Vec::new();
+    let mut premade = premade;
     for (attempt, backends) in order.iter().copied().enumerate() {
         let name = backends_name(backends);
         if attempt > 0 {
             log::warn!("Horizon renderer: trying {name} ({})", failures.join("; "));
         }
-        match open_with_retry(backends, window, offscreen, layers, allow_cpu).await {
+        match open_with_retry(
+            backends,
+            window,
+            offscreen,
+            layers,
+            allow_cpu,
+            premade.take(),
+        )
+        .await
+        {
             Ok(opened) => return Ok(opened),
             Err(e) => failures.push(e),
         }
@@ -2167,15 +2240,20 @@ async fn open_with_retry(
     offscreen: bool,
     layers: u32,
     allow_cpu: bool,
+    premade: Option<PremadeSurface>,
 ) -> std::result::Result<Opened, String> {
-    match open_backend(backends, window, offscreen, false, layers, allow_cpu).await {
+    match open_backend(
+        backends, window, offscreen, false, layers, allow_cpu, premade,
+    )
+    .await
+    {
         Err(NoDevice::NoAdapter(hidden)) => {
             log::warn!(
                 "Horizon renderer: {} has no conformant adapter ({hidden}); asking again for the \
                  ones wgpu hides as non-conformant",
                 backends_name(backends)
             );
-            match open_backend(backends, window, offscreen, true, layers, allow_cpu).await {
+            match open_backend(backends, window, offscreen, true, layers, allow_cpu, None).await {
                 Ok(opened) => {
                     log::warn!(
                         "Horizon renderer: using {} although its driver reports no Vulkan \
@@ -2201,23 +2279,33 @@ async fn open_backend(
     allow_nonconformant: bool,
     layers: u32,
     allow_cpu: bool,
+    premade: Option<PremadeSurface>,
 ) -> std::result::Result<Opened, NoDevice> {
     let name = backends_name(backends);
-    let instance = wgpu::Instance::new(instance_descriptor(
-        backends,
-        Some(window),
-        allow_nonconformant,
-    ));
-    log::info!("checkpoint: open_backend instance created");
-    let surface = if offscreen {
-        None
-    } else {
-        match instance.create_surface(window.clone()) {
-            Ok(surface) => Some(surface),
-            Err(e) => return Err(NoDevice::Failed(format!("{name} surface: {e}"))),
+    // A pair made ahead of the build (`premake_surface`) is this try's to
+    // use, when it was made for these backends; any other try — a fallback
+    // backend, the non-conformant retry — makes its own, as before.
+    let (instance, surface) = match premade {
+        Some(premade) if !offscreen && premade.backends == backends => {
+            (premade.instance, Some(premade.surface))
+        }
+        _ => {
+            let instance = wgpu::Instance::new(instance_descriptor(
+                backends,
+                Some(window),
+                allow_nonconformant,
+            ));
+            let surface = if offscreen {
+                None
+            } else {
+                match instance.create_surface(window.clone()) {
+                    Ok(surface) => Some(surface),
+                    Err(e) => return Err(NoDevice::Failed(format!("{name} surface: {e}"))),
+                }
+            };
+            (instance, surface)
         }
     };
-    log::info!("checkpoint: open_backend surface ready (offscreen: {offscreen})");
     let adapter = match instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -2230,10 +2318,6 @@ async fn open_backend(
         Ok(adapter) => adapter,
         Err(e) => return Err(NoDevice::NoAdapter(format!("{name}: {e}"))),
     };
-    log::info!(
-        "checkpoint: open_backend adapter resolved: {}",
-        adapter.get_info().name
-    );
     // NoAdapter, so `open_with_retry` asks again: with the non-conformant
     // adapters shown, wgpu ranks a real GPU (hasvk on Ivy Bridge or Haswell)
     // above a software one. The second try's error is final either way.
@@ -2325,10 +2409,6 @@ async fn open_backend(
         }
     }
     let opened = opened.expect("at least one device attempt");
-    log::info!(
-        "checkpoint: open_backend device resolved (ok: {})",
-        opened.is_ok()
-    );
     match opened {
         Ok((device, queue)) => {
             let device_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2608,6 +2688,7 @@ impl Renderer {
             previous
                 .map(|r| r.reuse_seed_for_layers(layers))
                 .transpose()?,
+            None,
             api,
             translucent_batching,
             wide_frame,
@@ -2633,15 +2714,16 @@ impl Renderer {
         panorama_faces: Arc<panorama::Faces>,
         prepared: Option<PreparedTextures>,
         previous: Option<RendererSeed>,
+        // A surface made on the window's thread ahead of this build
+        // (`premake_surface`), for a build with no `previous` to reuse
+        // that runs on another thread; `None` makes the surface here, on
+        // the caller's thread.
+        premade: Option<PremadeSurface>,
         api: GraphicsApi,
         translucent_batching: bool,
         wide_frame: bool,
         shader_pack: bool,
     ) -> Result<Self> {
-        log::info!(
-            "checkpoint: new_with_seed entered (previous: {})",
-            previous.is_some()
-        );
         let reused = previous.is_some();
         let present_mode = previous.as_ref().map(|r| r.present_mode);
         let reuse = previous
@@ -2668,6 +2750,10 @@ impl Renderer {
                         let spare = renderer.spare_surface.take();
                         Some(match spare {
                             Some(surface) => surface,
+                            // No spare: made here, so a build running on
+                            // another thread needs the seed's surface
+                            // prepared on the window's thread first
+                            // (`RendererSeed::prepare_surface`).
                             None => renderer.instance.create_surface(window.clone())?,
                         })
                     },
@@ -2680,10 +2766,9 @@ impl Renderer {
             }
             None => {
                 let _step = crate::spans::startup::step("renderer.open_device");
-                open_device(&window, offscreen, api, layers).await?
+                open_device(&window, offscreen, api, layers, premade).await?
             }
         };
-        log::info!("checkpoint: new_with_seed device opened");
         // Computed once: the sprite arrays, the shaders' constants and the
         // shader pack atlas all cut the sprites by it.
         let split = check_layers(&adapter, layers)?;
@@ -2729,7 +2814,6 @@ impl Renderer {
                 ));
             }
             surface.configure(&device, &config);
-            log::info!("checkpoint: new_with_seed surface configured");
             let hdr_output = hdr::output(&caps);
             crate::graphics::offer_hdr(hdr_output.is_some());
             if !reused {
@@ -4705,7 +4789,6 @@ impl Renderer {
             ));
         }
         let world_primitives = world_primitives::WorldPrimitives::new(&device, frame_format);
-        log::info!("checkpoint: new_with_seed returning the renderer");
         Ok(Self {
             display: DisplayWatch::default(),
             display_fresh: false,
