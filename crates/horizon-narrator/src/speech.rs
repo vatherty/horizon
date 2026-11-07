@@ -26,6 +26,10 @@ pub trait Speech {
 /// `Narrator.getNarrator`: the platform's speech, or why there is none
 /// (`Narrator.EMPTY`).
 fn open() -> Result<Box<dyn Speech>, String> {
+    // iOS has no speech backend by design: there is no narrator, which is
+    // not an error worth logging at every start.
+    #[cfg(target_os = "ios")]
+    return Ok(Box::new(Silent));
     #[cfg(windows)]
     return windows::Sapi::open().map(|s| Box::new(s) as Box<dyn Speech>);
     #[cfg(target_os = "macos")]
