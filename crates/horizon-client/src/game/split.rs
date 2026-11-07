@@ -170,13 +170,22 @@ pub(super) struct Split<'a> {
 
 impl<'a> Split<'a> {
     pub(super) fn new(host: Game<'a>) -> Self {
+        *Self::new_boxed(Box::new(host))
+    }
+
+    /// [`Split::new`] built directly in its box, from the already-boxed
+    /// host: the startup handoff (`Loading::finish_handoff`) runs on the
+    /// iOS main thread's ~1 MB stack, where neither a ~128 KiB `Game` nor
+    /// the `Split` around it can sit by value in a frame, so the host
+    /// moves box-to-box and the split is constructed in its allocation.
+    pub(super) fn new_boxed(host: Box<Game<'a>>) -> Box<Self> {
         let split = std::env::var("HORIZON_SPLIT").ok();
         let test_players = split
             .as_ref()
             .and_then(|n| n.parse::<usize>().ok())
             .map_or(0, |n| n.clamp(1, MAX_PLAYERS) - 1);
-        Self {
-            host,
+        Box::new(Self {
+            host: *host,
             guests: Vec::new(),
             test_players,
             forced: split.is_some(),
@@ -214,7 +223,7 @@ impl<'a> Split<'a> {
             fresh: Vec::new(),
             offers: Vec::new(),
             lost: Vec::new(),
-        }
+        })
     }
 
     fn players(&self) -> usize {
