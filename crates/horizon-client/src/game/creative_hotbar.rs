@@ -7,8 +7,9 @@ use horizon_world::nbt::Tag;
 impl Game<'_> {
     /// Whether the key bound to `mapping` is held.
     pub(super) fn mapped_key_down(&self, mapping: &str) -> bool {
-        keybinds::key_code(self.settings.keys.get(mapping))
-            .is_some_and(|k| self.physical_keys.contains(&k))
+        self.touch_holds_action(mapping)
+            || keybinds::key_code(self.settings.keys.get(mapping))
+                .is_some_and(|k| self.physical_keys.contains(&k))
     }
 
     /// `CreativeModeInventoryScreen.selectTab` on the HOTBAR tab: each saved
