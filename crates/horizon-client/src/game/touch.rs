@@ -10,10 +10,13 @@
 //! On the desktop the touch controls are off unless `HORIZON_TOUCH=1`; there the window
 //! system turns a touch into a mouse click anyway.
 use super::{Game, Screen};
+
+mod draw;
 use super::{event_loop::EventLoopCtl, input_trace::InputOrigin};
 use horizon_client::{
     Result, gamepad,
-    hud::{HudAtlas, HudBatch, rgba},
+    held::Source,
+    hud::HudBatch,
     osk::Hit,
     platform::{self, PointerButton, PointerEvent},
     touch::{self as controls, Action, Button, Layout, Mode, Phase, TouchControls},
@@ -22,7 +25,7 @@ use std::time::Instant;
 use winit::{
     dpi::PhysicalPosition,
     event::{DeviceId, ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent},
-    keyboard::KeyCode,
+    keyboard::{KeyCode, ModifiersState},
 };
 
 /// The touch controls' state in the game.
@@ -38,6 +41,9 @@ pub(super) struct TouchState {
     pointer: (f32, f32),
     /// The press that began on the on-screen keyboard is its own: its release is not a click.
     swallowing: bool,
+    held_buttons: Vec<Button>,
+    stick_sprint: bool,
+    sprint_input: bool,
 }
 
 impl Default for TouchState {
@@ -57,6 +63,9 @@ impl Default for TouchState {
             since: Instant::now(),
             pointer: (0.0, 0.0),
             swallowing: false,
+            held_buttons: Vec::new(),
+            stick_sprint: false,
+            sprint_input: false,
         }
     }
 }
@@ -141,8 +150,66 @@ impl Game<'_> {
             Button::Inventory => "key.inventory",
             Button::Chat => "key.chat",
             Button::Drop => "key.drop",
+            Button::PickBlock => "key.pickItem",
+            Button::SwapHands => "key.swapOffhand",
+            Button::Perspective => "key.togglePerspective",
+            Button::QuickActions => "key.quickActions",
+            Button::Emote => "key.emote",
+            Button::PlayerList => "key.playerlist",
             _ => return None,
         })
+    }
+
+    /// GUI units reserved above the phone's home indicator, shared by drawing and hits.
+    pub(super) fn touch_hud_bottom_inset(&self, batch: &HudBatch) -> f32 {
+        if !self.touch.enabled {
+            return 0.0;
+        }
+        let density = self
+            .window
+            .as_ref()
+            .map_or(1.0, |w| w.scale_factor() as f32)
+            .max(0.5);
+        let insets = safe_insets(
+            self.window.as_deref(),
+            batch.width * batch.scale,
+            batch.height * batch.scale,
+            density,
+        );
+        (insets
+            .bottom
+            .max(self.touch.controls.layout().margin * density)
+            / batch.scale)
+            .ceil()
+    }
+
+    /// Touch holds also protect mappings from keyboard modifier recovery and
+    /// provide the creative toolbar activators without pretending a physical key is down.
+    pub(super) fn touch_holds_action(&self, action: &str) -> bool {
+        let held = |b| self.touch.held_buttons.contains(&b);
+        self.touch.enabled
+            && match action {
+                "key.sneak" => held(Button::Sneak) || held(Button::FlyDown),
+                "key.sprint" => held(Button::Sprint) || self.touch.stick_sprint,
+                "key.saveToolbarActivator" => held(Button::SaveToolbar),
+                "key.loadToolbarActivator" => held(Button::LoadToolbar),
+                _ => false,
+            }
+    }
+
+    pub(super) fn touch_shift_down(&self) -> bool {
+        self.touch.enabled && self.touch.controls.shift()
+    }
+
+    pub(super) fn touch_control_down(&self) -> bool {
+        self.touch.enabled && self.touch.controls.control()
+    }
+
+    fn touch_modifiers(&self) -> ModifiersState {
+        let mut modifiers = self.modifiers;
+        modifiers.set(ModifiersState::SHIFT, self.has_shift_down());
+        modifiers.set(ModifiersState::CONTROL, self.has_control_down());
+        modifiers
     }
 
     /// The movement stick as the controller's left stick, while a finger holds it.
@@ -155,7 +222,13 @@ impl Game<'_> {
 
     /// The touch controls for the open screen: the world's, or a menu's.
     fn touch_mode(&self) -> Mode {
+        let overlay = self.dialog_open()
+            || self.link_prompt.is_some()
+            || self.command_prompt.is_some()
+            || self.code_of_conduct.is_some()
+            || self.server_packs.prompt.is_some();
         if self.title.is_none()
+            && !overlay
             && self.screen == Screen::Playing
             && self.sign_edit.is_none()
             && self.book.is_none()
@@ -163,6 +236,8 @@ impl Game<'_> {
             && self.sleeping.is_none()
         {
             Mode::Playing
+        } else if matches!(self.screen, Screen::Inventory | Screen::Creative) && !overlay {
+            Mode::Inventory
         } else {
             Mode::Menu
         }
@@ -186,7 +261,7 @@ impl Game<'_> {
                 // `Gui` draws the hotbar 182 by 22 GUI pixels, centred at the bottom.
                 hotbar: controls::Rect {
                     x: (batch.width / 2.0 - 91.0) * s,
-                    y: (batch.height - 22.0) * s,
+                    y: ((batch.height - self.touch_hud_bottom_inset(&batch)).floor() - 22.0) * s,
                     w: 182.0 * s,
                     h: 22.0 * s,
                 },
@@ -214,16 +289,24 @@ impl Game<'_> {
         self.touch_actions(event_loop, actions);
     }
 
-    /// Lets go of everything the touch controls hold (the window lost its surface, or the app its
-    /// focus). A menu pointer press cannot be undone without an event loop; it ends with its finger.
+    /// Release HUD holds and menu drags on focus/surface loss.
     pub(super) fn touch_release(&mut self) {
         for action in self.touch.controls.release_all() {
             let result = match action {
                 Action::Press(button) => self.touch_button(button, true),
                 Action::Release(button) => self.touch_button(button, false),
-                Action::Sprint(on) => self.pad_action("key.sprint", on),
-                Action::Shift(false) => {
-                    self.physical_keys.remove(&KeyCode::ShiftLeft);
+                Action::Sprint(on) => self.touch_sprint(on),
+                Action::PointerButton { right, down: false } => {
+                    if matches!(self.screen, Screen::Inventory | Screen::Creative)
+                        && !self.touch.swallowing
+                    {
+                        self.inventory_mouse_release(right);
+                    }
+                    self.touch.swallowing = false;
+                    Ok(())
+                }
+                Action::PointerMiddle(false) => {
+                    self.inventory_pick_release();
                     Ok(())
                 }
                 _ => Ok(()),
@@ -354,21 +437,22 @@ impl Game<'_> {
             }
             Action::Sprint(on) => {
                 if self.screen == Screen::Playing {
-                    self.pad_action("key.sprint", on)?;
+                    self.touch_sprint(on)?;
                 }
             }
             Action::Press(button) => self.touch_button(button, true)?,
             Action::Release(button) => self.touch_button(button, false)?,
             Action::SelectSlot(slot) => {
-                if self.screen == Screen::Playing {
-                    self.selected = slot;
+                if self.screen == Screen::Playing
+                    && let Some(&key) = super::HOTBAR_DIGITS.get(slot)
+                {
+                    self.key_pressed(key, key)?;
                 }
             }
             Action::StepSlot(steps) => {
                 if self.screen == Screen::Playing {
-                    for _ in 0..steps.unsigned_abs() {
-                        self.selected = gamepad::hotbar_step(self.selected, steps > 0);
-                    }
+                    // Follow the normal wheel path for spectator menus too.
+                    self.touch_wheel(event_loop, 0.0, -steps as f32);
                 }
             }
             Action::PointerMove { x, y } => {
@@ -378,12 +462,17 @@ impl Game<'_> {
             Action::PointerButton { right, down } => {
                 self.touch_pointer_button(event_loop, right, down);
             }
-            Action::Shift(on) => {
-                // `has_shift_down` reads the physical keys.
-                if on {
-                    self.physical_keys.insert(KeyCode::ShiftLeft);
+            // The controls own touch modifier latches; physical modifiers stay
+            // owned by the OS. Screen queries combine both sources.
+            Action::Shift(_) | Action::Control(_) => {}
+            Action::PointerMiddle(down) => {
+                if down {
+                    self.inventory_pick_press();
                 } else {
-                    self.physical_keys.remove(&KeyCode::ShiftLeft);
+                    self.inventory_pick_release();
+                }
+                if let Some(key) = self.container {
+                    self.container_changed(key);
                 }
             }
             Action::Scroll(lines) => self.touch_wheel(event_loop, 0.0, lines),
@@ -391,17 +480,132 @@ impl Game<'_> {
         Ok(())
     }
 
+    fn touch_sprint(&mut self, stick: bool) -> Result<()> {
+        self.touch.stick_sprint = stick;
+        let on = stick || self.touch.held_buttons.contains(&Button::Sprint);
+        if on == self.touch.sprint_input {
+            return Ok(());
+        }
+        self.touch.sprint_input = on;
+        self.mapped_key(
+            KeyCode::ControlLeft,
+            on,
+            false,
+            KeyCode::ControlLeft,
+            Source::Touch,
+        )
+    }
+
     fn touch_button(&mut self, button: Button, down: bool) -> Result<()> {
+        if down {
+            self.touch.held_buttons.push(button);
+        } else if let Some(i) = self.touch.held_buttons.iter().position(|b| *b == button) {
+            self.touch.held_buttons.remove(i);
+        }
+        let held = |b| self.touch.held_buttons.contains(&b);
+        match button {
+            Button::Jump | Button::FlyUp => {
+                let on = held(Button::Jump) || held(Button::FlyUp);
+                return self.mapped_key(KeyCode::Space, on, false, KeyCode::Space, Source::Touch);
+            }
+            // Flight descent is held input even with toggle-crouch enabled. It
+            // shares the logical key with sneak, but owns a separate device bit.
+            Button::FlyDown => {
+                if down {
+                    self.keys.press(KeyCode::ShiftLeft, Source::Touch);
+                } else if !self.toggles.is_down(horizon_client::keymapping::SNEAK) {
+                    self.keys.release(&KeyCode::ShiftLeft, Source::Touch);
+                }
+                return Ok(());
+            }
+            Button::Sprint => return self.touch_sprint(self.touch.stick_sprint),
+            Button::SaveToolbar | Button::LoadToolbar | Button::FlyToggle => return Ok(()),
+            _ => {}
+        }
         if let Some(name) = Self::touch_action_name(button) {
-            self.pad_action(name, down)?;
-            // Chat from a touch screen comes with its keyboard.
+            let modifiers = self.modifiers;
+            self.modifiers = self.touch_modifiers();
+            let result = match gamepad::route(name) {
+                Some(gamepad::Route::Key(key)) => {
+                    self.mapped_key(key, down, false, key, Source::Touch)
+                }
+                Some(gamepad::Route::Sneak) => self.mapped_key(
+                    KeyCode::ShiftLeft,
+                    down,
+                    false,
+                    KeyCode::ShiftLeft,
+                    Source::Touch,
+                ),
+                Some(gamepad::Route::Mouse(button)) => self.play_mouse(button, down),
+                _ => Ok(()),
+            };
+            self.modifiers = modifiers;
+            result?;
             if down && button == Button::Chat && self.screen == Screen::Chat {
                 self.touch_keyboard(true);
             }
             return Ok(());
         }
+        // Armed toolbar actions run after the next target-slot tap moves the
+        // pointer. Use the existing inventory handlers, including server packets.
+        if down
+            && matches!(self.screen, Screen::Inventory | Screen::Creative)
+            && !self.dialog_open()
+        {
+            match button {
+                Button::MenuHotbar(slot) => {
+                    if let Some(&key) = super::HOTBAR_DIGITS.get(slot) {
+                        self.inventory_hotkey(key);
+                    }
+                }
+                Button::MenuSwapHands => {
+                    self.inventory_hotkey(KeyCode::KeyF);
+                }
+                Button::MenuDrop | Button::MenuDropStack => {
+                    let previous = self.modifiers;
+                    self.modifiers
+                        .set(ModifiersState::CONTROL, button == Button::MenuDropStack);
+                    self.inventory_hotkey(KeyCode::KeyQ);
+                    self.modifiers = previous;
+                }
+                Button::MenuClone => {
+                    self.inventory_pick_press();
+                    self.inventory_pick_release();
+                    if let Some(key) = self.container {
+                        self.container_changed(key);
+                    }
+                }
+                Button::MenuCollect => {
+                    if let Some(slot) = self.inventory_target().0 {
+                        // Pick up a seed stack if needed, then the same menu
+                        // PickupAll operation used by double-click collection.
+                        if self.carried.is_none() {
+                            self.menu_click(Some(slot), 0, horizon_client::menu::Input::Pickup);
+                        }
+                        self.menu_click(Some(slot), 0, horizon_client::menu::Input::PickupAll);
+                        if let Some(key) = self.container {
+                            self.container_changed(key);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         match button {
-            Button::Pause | Button::Back if down => self.pad_back()?,
+            Button::Pause | Button::Back if down => {
+                if self.command_prompt.is_some() {
+                    self.command_prompt_key(KeyCode::Escape);
+                } else if self.link_prompt.is_some() {
+                    self.answer_link_prompt(false);
+                } else if self.code_of_conduct.is_some() { /* This screen disallows Escape. */
+                } else if self.server_packs.prompt.is_some() {
+                    self.answer_pack_prompt(false)?;
+                } else if self.dialog_open() {
+                    self.dialog_key(KeyCode::Escape, None, None)?;
+                } else {
+                    self.pad_back()?;
+                }
+            }
             Button::Keyboard if down => {
                 let open = self.pad.menu.osk.is_some();
                 self.touch_keyboard(!open);
@@ -504,6 +708,8 @@ impl Game<'_> {
         let Some(id) = self.window.as_ref().map(|w| w.id()) else {
             return;
         };
+        let modifiers = self.modifiers;
+        self.modifiers = self.touch_modifiers();
         self.handle_window_event(
             event_loop,
             id,
@@ -518,6 +724,7 @@ impl Game<'_> {
             },
             InputOrigin::User,
         );
+        self.modifiers = modifiers;
     }
 
     fn touch_wheel(&mut self, event_loop: &dyn EventLoopCtl, x: f32, y: f32) {
@@ -537,112 +744,18 @@ impl Game<'_> {
     }
 
     // ---- drawing ----
-
-    /// The buttons and the stick, over the HUD. Plain fills and the game's font, so the
-    /// menu theme's animation clock is left alone.
     pub(super) fn draw_touch(&self, batch: &mut HudBatch) {
         if !self.touch.enabled {
             return;
         }
-        let view = self.touch.controls.view();
-        let atlas = &self.gui.atlas;
-        let s = batch.scale;
-        let plate = rgba(24, 24, 28, 120);
-        let lit = rgba(255, 255, 255, 150);
-        if self.touch.controls.mode() == Mode::Playing {
-            let stick = view.stick;
-            let (cx, cy, r) = (stick.base.0 / s, stick.base.1 / s, stick.radius / s);
-            let alpha = if stick.active { 90 } else { 45 };
-            round_rect(
-                batch,
-                atlas,
-                cx - r,
-                cy - r,
-                2.0 * r,
-                2.0 * r,
-                r,
-                rgba(24, 24, 28, alpha),
-            );
-            let (kx, ky, kr) = (stick.knob.0 / s, stick.knob.1 / s, r * 0.45);
-            let alpha = if stick.active { 170 } else { 70 };
-            round_rect(
-                batch,
-                atlas,
-                kx - kr,
-                ky - kr,
-                2.0 * kr,
-                2.0 * kr,
-                kr,
-                rgba(230, 230, 235, alpha),
-            );
-        }
-        for b in &view.buttons {
-            let r = b.rect;
-            let (x, y, w, h) = (r.x / s, r.y / s, r.w / s, r.h / s);
-            // Sneak stays lit while the player sneaks (it toggles).
-            let lit_now =
-                b.lit || (b.button == Button::Sneak && self.keys.contains(&KeyCode::ShiftLeft));
-            round_rect(
-                batch,
-                atlas,
-                x,
-                y,
-                w,
-                h,
-                (h / 4.0).max(2.0),
-                if lit_now { lit } else { plate },
-            );
-            let label = b.button.label();
-            let width = HudBatch::text_width(atlas, label);
-            let ink = if lit_now {
-                rgba(20, 20, 20, 255)
-            } else {
-                rgba(255, 255, 255, 255)
-            };
-            batch.text(
-                atlas,
-                label,
-                (x + (w - width) / 2.0).floor(),
-                (y + (h - 8.0) / 2.0).floor(),
-                ink,
-                !lit_now,
-            );
-        }
-    }
-}
-
-/// A rounded rectangle from one-pixel rows, in GUI pixels.
-fn round_rect(
-    batch: &mut HudBatch,
-    atlas: &HudAtlas,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    radius: f32,
-    color: u32,
-) {
-    let radius = radius.min(w / 2.0).min(h / 2.0).max(0.0);
-    let rows = h.ceil() as i32;
-    for i in 0..rows {
-        let mid = i as f32 + 0.5;
-        // How far this row is from the nearest top or bottom edge.
-        let edge = mid.min(h - mid);
-        let inset = if edge < radius {
-            radius
-                - (radius * radius - (radius - edge) * (radius - edge))
-                    .max(0.0)
-                    .sqrt()
-        } else {
-            0.0
-        };
-        batch.fill(
-            atlas,
-            x + inset,
-            y + i as f32,
-            (w - 2.0 * inset).max(0.0),
-            1.0,
-            color,
+        draw::draw(
+            batch,
+            &self.gui.atlas,
+            &self.touch.controls.view(),
+            self.touch.controls.mode() == Mode::Playing,
+            self.keys.contains(&KeyCode::ShiftLeft),
+            self.keys.contains(&KeyCode::ControlLeft),
+            self.player.as_ref().is_some_and(|p| p.flying),
         );
     }
 }
