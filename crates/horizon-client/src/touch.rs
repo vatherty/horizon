@@ -38,6 +38,19 @@ pub enum Button {
     // In the world.
     Jump,
     Sneak,
+    Sprint,
+    FlyUp,
+    FlyDown,
+    /// Double-jump using the existing flight gesture.
+    FlyToggle,
+    PickBlock,
+    SwapHands,
+    Perspective,
+    SaveToolbar,
+    LoadToolbar,
+    QuickActions,
+    Emote,
+    PlayerList,
     /// Attack and mine: held down it keeps mining.
     Break,
     /// Place a block or use the item in hand: held down it keeps using it.
@@ -52,6 +65,16 @@ pub enum Button {
     Back,
     /// Holds Shift for the next clicks (quick-move in inventories).
     Shift,
+    /// Sticky Control modifier, also available for picking block data in the world.
+    Control,
+    MenuHotbar(usize),
+    MenuSwapHands,
+    MenuDrop,
+    MenuDropStack,
+    MenuClone,
+    MenuCollect,
+    /// Makes the next drag a middle click (creative fill distribution).
+    MenuMiddleClick,
     /// Makes the next tap a right click (split a stack).
     RightClick,
     ScrollUp,
@@ -61,23 +84,49 @@ pub enum Button {
 }
 
 impl Button {
-    /// The text on the button.
-    pub fn label(self) -> &'static str {
+    /// Translation key for the compact caption below the icon.
+    pub fn label_key(self) -> &'static str {
         match self {
-            Button::Jump => "Jump",
-            Button::Sneak => "Sneak",
-            Button::Break => "Break",
-            Button::Place => "Place",
-            Button::Inventory => "Inv",
-            Button::Chat => "Chat",
-            Button::Pause => "Menu",
-            Button::Drop => "Drop",
-            Button::Back => "Back",
-            Button::Shift => "Shift",
-            Button::RightClick => "Right",
-            Button::ScrollUp => "Up",
-            Button::ScrollDown => "Down",
-            Button::Keyboard => "Keys",
+            Button::Jump => "horizon.touch.jump",
+            Button::Sneak => "horizon.touch.sneak",
+            Button::Sprint => "horizon.touch.sprint",
+            Button::FlyUp => "horizon.touch.fly_up",
+            Button::FlyDown => "horizon.touch.fly_down",
+            Button::FlyToggle => "horizon.touch.fly",
+            Button::PickBlock => "horizon.touch.pick",
+            Button::SwapHands | Button::MenuSwapHands => "horizon.touch.swap",
+            Button::Perspective => "horizon.touch.camera",
+            Button::SaveToolbar => "horizon.touch.save_toolbar",
+            Button::LoadToolbar => "horizon.touch.load_toolbar",
+            Button::QuickActions => "horizon.touch.quick_actions",
+            Button::Emote => "horizon.touch.emote",
+            Button::PlayerList => "horizon.touch.players",
+            Button::Break => "horizon.touch.mine",
+            Button::Place => "horizon.touch.use",
+            Button::Inventory => "horizon.touch.inventory",
+            Button::Chat => "horizon.touch.chat",
+            Button::Pause => "horizon.touch.pause",
+            Button::Drop | Button::MenuDrop => "horizon.touch.drop",
+            Button::Back => "horizon.touch.back",
+            Button::Shift => "horizon.touch.quick_move",
+            Button::Control => "horizon.touch.control",
+            Button::RightClick => "horizon.touch.split",
+            Button::MenuMiddleClick => "horizon.touch.fill",
+            Button::ScrollUp => "horizon.touch.scroll_up",
+            Button::ScrollDown => "horizon.touch.scroll_down",
+            Button::Keyboard => "horizon.touch.keyboard",
+            Button::MenuDropStack => "horizon.touch.drop_stack",
+            Button::MenuClone => "horizon.touch.clone",
+            Button::MenuCollect => "horizon.touch.collect",
+            Button::MenuHotbar(0) => "horizon.touch.slot_1",
+            Button::MenuHotbar(1) => "horizon.touch.slot_2",
+            Button::MenuHotbar(2) => "horizon.touch.slot_3",
+            Button::MenuHotbar(3) => "horizon.touch.slot_4",
+            Button::MenuHotbar(4) => "horizon.touch.slot_5",
+            Button::MenuHotbar(5) => "horizon.touch.slot_6",
+            Button::MenuHotbar(6) => "horizon.touch.slot_7",
+            Button::MenuHotbar(7) => "horizon.touch.slot_8",
+            Button::MenuHotbar(_) => "horizon.touch.slot_9",
         }
     }
 }
@@ -87,7 +136,9 @@ impl Button {
 pub enum Mode {
     /// Walking around: stick, look, buttons, hotbar.
     Playing,
-    /// Any screen: a pointer and the toolbar.
+    /// An inventory or creative screen: pointer, slot actions and modifiers.
+    Inventory,
+    /// Any other screen: pointer, back, scrolling and keyboard.
     Menu,
 }
 
@@ -131,6 +182,9 @@ pub enum Action {
     },
     /// The Shift toggle changed.
     Shift(bool),
+    Control(bool),
+    /// Middle-button menu drag.
+    PointerMiddle(bool),
     /// Scroll a menu by this many lines (positive: up, like the wheel).
     Scroll(f32),
 }
@@ -326,79 +380,242 @@ fn arrange(layout: &Layout, screen: Screen, mode: Mode) -> Arrangement {
     let small = b * 0.78;
     let radius = (layout.stick_radius * dp).max(b);
     let hotbar = screen.hotbar;
-    let hotbar_top = if hotbar.w > 0.0 {
-        hotbar.y - g
-    } else {
-        screen.height
-    };
-    // Rows of controls beside the hotbar sit on the bottom margin; where the
-    // screen is too narrow for that (portrait) they rise above the hotbar.
-    let cluster_width = 2.0 * b + g;
-    let cluster_left = screen.width - m_right - cluster_width;
-    let cluster_bottom = if hotbar.w > 0.0 && cluster_left < hotbar.x + hotbar.w + g {
-        hotbar_top
-    } else {
-        screen.height - m_bottom
-    };
-    let stick_right = m_left + 2.0 * radius;
-    let stick_bottom = if hotbar.w > 0.0 && stick_right > hotbar.x - g {
-        hotbar_top
-    } else {
-        screen.height - m_bottom
-    };
-    let home = (
-        (m_left + radius).min(screen.width / 2.0),
-        (stick_bottom - radius).max(radius),
-    );
     let right = screen.width - m_right;
+    let bottom = screen.height - m_bottom;
+    let mut home = (m_left + radius, bottom - radius);
     let mut buttons = Vec::new();
+    let rect = |x, y, w, h| Rect { x, y, w, h };
     match mode {
         Mode::Playing => {
-            let cell = |col: f32, row: f32| Rect {
-                x: right - b - col * (b + g),
-                y: cluster_bottom - b - row * (b + g),
-                w: b,
-                h: b,
+            // The reference's bottom row flanks the nine-slot bar. On narrower
+            // screens it becomes a centred row immediately above that bar.
+            let side_width = 2.0 * small + g;
+            let beside = hotbar.w > 0.0
+                && hotbar.x - g - side_width >= m_left
+                && hotbar.x + hotbar.w + g + side_width <= right;
+            let utility_y = if beside || hotbar.w <= 0.0 {
+                bottom - small
+            } else {
+                hotbar.y - g - small
             };
-            buttons.push((Button::Break, cell(0.0, 0.0)));
-            buttons.push((Button::Place, cell(1.0, 0.0)));
-            buttons.push((Button::Jump, cell(0.0, 1.0)));
-            buttons.push((Button::Sneak, cell(1.0, 1.0)));
-            let top = |x: f32| Rect {
-                x,
-                y: m_top,
-                w: small,
-                h: small,
+            let left = if beside {
+                hotbar.x - g - side_width
+            } else {
+                (m_left + (right - m_left - 4.0 * small - 3.0 * g) / 2.0).max(m_left)
             };
-            buttons.push((Button::Pause, top(m_left)));
-            buttons.push((Button::Chat, top(m_left + small + g)));
-            buttons.push((Button::Inventory, top(screen.width - m_right - small)));
-            buttons.push((Button::Drop, top(screen.width - m_right - 2.0 * small - g)));
+            for (i, button) in [Button::SwapHands, Button::PickBlock]
+                .into_iter()
+                .enumerate()
+            {
+                buttons.push((
+                    button,
+                    rect(left + i as f32 * (small + g), utility_y, small, small),
+                ));
+            }
+            let inventory_x = if beside {
+                hotbar.x + hotbar.w + g
+            } else {
+                left + 2.0 * (small + g)
+            };
+            buttons.push((
+                Button::Inventory,
+                rect(inventory_x, utility_y, small, small),
+            ));
+            buttons.push((
+                Button::Drop,
+                rect(inventory_x + small + g, utility_y, small, small),
+            ));
+
+            // Keep both thumbs above the utility row and the safe-area hotbar.
+            let cluster_bottom = utility_y - g;
+            let cluster_left = right - 2.0 * b - g;
+            buttons.push((Button::Break, rect(cluster_left, cluster_bottom - b, b, b)));
+            buttons.push((Button::Place, rect(right - b, cluster_bottom - b, b, b)));
+            buttons.push((
+                Button::Sneak,
+                rect(cluster_left, cluster_bottom - 2.0 * b - g, b, b),
+            ));
+            buttons.push((
+                Button::Jump,
+                rect(cluster_left, cluster_bottom - 3.0 * b - 2.0 * g, b, b),
+            ));
+            buttons.push((
+                Button::FlyDown,
+                rect(right - small, cluster_bottom - 2.0 * b - g, small, small),
+            ));
+            buttons.push((
+                Button::FlyUp,
+                rect(
+                    right - small,
+                    cluster_bottom - 3.0 * b - 2.0 * g,
+                    small,
+                    small,
+                ),
+            ));
+            buttons.push((
+                Button::FlyToggle,
+                rect(
+                    cluster_left - small - g,
+                    cluster_bottom - 3.0 * b - 2.0 * g,
+                    small,
+                    small,
+                ),
+            ));
+            let stick_right = m_left + 2.0 * radius;
+            let stick_clear = hotbar.w > 0.0 && stick_right + g <= left;
+            home.1 = if stick_clear {
+                bottom - radius
+            } else {
+                cluster_bottom - radius
+            };
+            buttons.push((
+                Button::Sprint,
+                rect(m_left, home.1 - radius - small - g, small, small),
+            ));
+            for (i, button) in [Button::Chat, Button::Perspective, Button::Pause]
+                .into_iter()
+                .enumerate()
+            {
+                buttons.push((
+                    button,
+                    rect(
+                        right - (3 - i) as f32 * small - (2 - i) as f32 * g,
+                        m_top,
+                        small,
+                        small,
+                    ),
+                ));
+            }
+            // Less frequent vanilla actions have their own compact utility row,
+            // below the status area. Wrapping keeps portrait layouts usable too.
+            let extras = [
+                Button::Control,
+                Button::SaveToolbar,
+                Button::LoadToolbar,
+                Button::QuickActions,
+                Button::Emote,
+                Button::PlayerList,
+                Button::ScrollUp,
+                Button::ScrollDown,
+            ];
+            let extra_x = m_left + small + g;
+            let cols =
+                (((right - extra_x + g) / (small + g)).floor() as usize).clamp(1, extras.len());
+            for (i, button) in extras.into_iter().enumerate() {
+                buttons.push((
+                    button,
+                    rect(
+                        extra_x + (i % cols) as f32 * (small + g),
+                        m_top + small + g + (i / cols) as f32 * (small + g),
+                        small,
+                        small,
+                    ),
+                ));
+            }
         }
         Mode::Menu => {
-            let order = [
+            let menu_small = small.min((screen.height - m_top - m_bottom - 3.0 * g) / 4.0);
+            for (i, button) in [
+                Button::Back,
+                Button::ScrollUp,
+                Button::ScrollDown,
+                Button::Keyboard,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                buttons.push((
+                    button,
+                    rect(
+                        m_left,
+                        m_top + i as f32 * (menu_small + g),
+                        menu_small,
+                        menu_small,
+                    ),
+                ));
+            }
+        }
+        Mode::Inventory => {
+            // Rails sit at the edges, leaving the inventory and its pointer clear.
+            // The final row is the nine number-key swaps for the pointed-at slot.
+            let menu_small = small.min((screen.height - m_top - m_bottom - 8.0 * g) / 8.0);
+            let row_y = bottom - menu_small;
+            let left_order = [
                 Button::Back,
                 Button::Shift,
                 Button::RightClick,
+                Button::Control,
                 Button::ScrollUp,
                 Button::ScrollDown,
                 Button::Keyboard,
             ];
-            let total = order.len() as f32 * small + (order.len() as f32 - 1.0) * g;
-            let top = ((screen.height - total) / 2.0).max(m_top);
-            for (i, button) in order.into_iter().enumerate() {
+            let right_order = [
+                Button::MenuSwapHands,
+                Button::MenuDrop,
+                Button::MenuDropStack,
+                Button::MenuClone,
+                Button::MenuCollect,
+                Button::MenuMiddleClick,
+            ];
+            if screen.height > screen.width {
+                // An open recipe book spans the portrait screen's width. Put
+                // its controls above the centred inventory instead of alongside
+                // its slots, where an edge rail would intercept slot touches.
+                let cols = (((right - m_left + g) / (menu_small + g)).floor() as usize).clamp(4, 5);
+                let grid_x =
+                    (m_left + right - cols as f32 * menu_small - (cols - 1) as f32 * g) / 2.0;
+                for (i, button) in left_order.into_iter().chain(right_order).enumerate() {
+                    buttons.push((
+                        button,
+                        rect(
+                            grid_x + (i % cols) as f32 * (menu_small + g),
+                            m_top + (i / cols) as f32 * (menu_small + g),
+                            menu_small,
+                            menu_small,
+                        ),
+                    ));
+                }
+            } else {
+                for (i, button) in left_order.into_iter().enumerate() {
+                    buttons.push((
+                        button,
+                        rect(
+                            m_left,
+                            m_top + i as f32 * (menu_small + g),
+                            menu_small,
+                            menu_small,
+                        ),
+                    ));
+                }
+                for (i, button) in right_order.into_iter().enumerate() {
+                    buttons.push((
+                        button,
+                        rect(
+                            right - menu_small,
+                            m_top + i as f32 * (menu_small + g),
+                            menu_small,
+                            menu_small,
+                        ),
+                    ));
+                }
+            }
+            let slot_gap = (g / 2.0).min((right - m_left) / 40.0);
+            let slot_w = menu_small.min((right - m_left - 8.0 * slot_gap) / 9.0);
+            let row_x = (m_left + right - 9.0 * slot_w - 8.0 * slot_gap) / 2.0;
+            for slot in 0..HOTBAR_SLOTS {
                 buttons.push((
-                    button,
-                    Rect {
-                        x: m_left,
-                        y: top + i as f32 * (small + g),
-                        w: small,
-                        h: small,
-                    },
+                    Button::MenuHotbar(slot),
+                    rect(
+                        row_x + slot as f32 * (slot_w + slot_gap),
+                        row_y,
+                        slot_w,
+                        menu_small,
+                    ),
                 ));
             }
         }
     }
+
     Arrangement {
         buttons,
         home,
@@ -495,6 +712,13 @@ pub struct TouchControls {
     sprinting: bool,
     held: Vec<Button>,
     shift: bool,
+    control: bool,
+    middle_next: bool,
+    /// A discrete inventory shortcut waiting for the player to tap its slot.
+    pending_menu: Option<Button>,
+    pointer_middle: bool,
+    /// Next phase of the existing double-jump flight gesture.
+    fly_pulse: Option<(u8, f64)>,
     right_next: bool,
     /// The menu pointer's right-click state when it went down.
     pointer_right: bool,
@@ -518,6 +742,11 @@ impl TouchControls {
             sprinting: false,
             held: Vec::new(),
             shift: false,
+            control: false,
+            middle_next: false,
+            pending_menu: None,
+            pointer_middle: false,
+            fly_pulse: None,
             right_next: false,
             pointer_right: false,
             scroll_at: 0.0,
@@ -577,15 +806,22 @@ impl TouchControls {
 
     /// Marks a button held and says so.
     fn press_button(&mut self, button: Button, out: &mut Vec<Action>) {
+        let first = !self.held.contains(&button);
         self.held.push(button);
-        out.push(Action::Press(button));
+        if first {
+            out.push(Action::Press(button));
+        }
     }
 
     /// Lets go of one hold on a button, if any.
     fn release_button(&mut self, button: Button) -> Vec<Action> {
         if let Some(at) = self.held.iter().position(|b| *b == button) {
             self.held.remove(at);
-            vec![Action::Release(button)]
+            if self.held.contains(&button) {
+                Vec::new()
+            } else {
+                vec![Action::Release(button)]
+            }
         } else {
             Vec::new()
         }
@@ -607,14 +843,20 @@ impl TouchControls {
     pub fn release_all(&mut self) -> Vec<Action> {
         let mut out = Vec::new();
         if self.fingers.iter().any(|f| matches!(f.role, Role::Pointer)) {
-            out.push(Action::PointerButton {
-                right: self.pointer_right,
-                down: false,
-            });
+            if self.pointer_middle {
+                out.push(Action::PointerMiddle(false));
+            } else {
+                out.push(Action::PointerButton {
+                    right: self.pointer_right,
+                    down: false,
+                });
+            }
         }
         self.fingers.clear();
         for button in std::mem::take(&mut self.held) {
-            out.push(Action::Release(button));
+            if !out.contains(&Action::Release(button)) {
+                out.push(Action::Release(button));
+            }
         }
         if self.stick.take().is_some() || self.moving != [0.0; 2] {
             self.moving = [0.0; 2];
@@ -628,7 +870,17 @@ impl TouchControls {
             self.shift = false;
             out.push(Action::Shift(false));
         }
+        if self.control {
+            self.control = false;
+            out.push(Action::Control(false));
+        }
+        if self.fly_pulse.take().is_some() {
+            out.extend(self.release_button(Button::Jump));
+        }
         self.right_next = false;
+        self.middle_next = false;
+        self.pending_menu = None;
+        self.pointer_middle = false;
         out
     }
 
@@ -640,6 +892,10 @@ impl TouchControls {
     /// Whether any finger is on the controls.
     pub fn active(&self) -> bool {
         !self.fingers.is_empty()
+    }
+
+    pub fn control(&self) -> bool {
+        self.control
     }
 
     pub fn shift(&self) -> bool {
@@ -657,7 +913,10 @@ impl TouchControls {
                 rect,
                 lit: self.held.contains(&button)
                     || (button == Button::Shift && self.shift)
-                    || (button == Button::RightClick && self.right_next),
+                    || (button == Button::RightClick && self.right_next)
+                    || (button == Button::Control && self.control)
+                    || (button == Button::MenuMiddleClick && self.middle_next)
+                    || self.pending_menu == Some(button),
             })
             .collect();
         let radius = self.arranged.radius;
@@ -742,7 +1001,19 @@ impl TouchControls {
             Mode::Playing => {
                 if let Some(button) = self.button_at(x, y) {
                     role = Role::Button(button);
-                    self.press_button(button, &mut out);
+                    if button == Button::Control {
+                        self.control = !self.control;
+                        out.push(Action::Control(self.control));
+                    } else if button == Button::FlyToggle {
+                        if self.fly_pulse.is_none() {
+                            self.press_button(Button::Jump, &mut out);
+                            self.fly_pulse = Some((1, now + 0.08));
+                        }
+                    } else if matches!(button, Button::ScrollUp | Button::ScrollDown) {
+                        out.extend(self.menu_button(button, now));
+                    } else {
+                        self.press_button(button, &mut out);
+                    }
                 } else if self.on_hotbar(x, y) {
                     role = Role::Hotbar;
                     out.push(Action::SelectSlot(self.slot_at(x)));
@@ -766,20 +1037,32 @@ impl TouchControls {
                     });
                 }
             }
-            Mode::Menu => {
+            Mode::Menu | Mode::Inventory => {
                 if let Some(button) = self.button_at(x, y) {
                     role = Role::Button(button);
                     out.extend(self.menu_button(button, now));
                 } else if self.fingers.iter().any(|f| matches!(f.role, Role::Pointer)) {
                     role = Role::Ignored;
+                } else if let Some(button) = self.pending_menu.take() {
+                    // Target the slot without picking its item up first. Toolbar
+                    // activation alone cannot hover a slot on a touch screen.
+                    role = Role::Ignored;
+                    out.push(Action::PointerMove { x, y });
+                    out.push(Action::Press(button));
+                    out.push(Action::Release(button));
                 } else {
                     role = Role::Pointer;
                     self.pointer_right = self.right_next;
+                    self.pointer_middle = self.middle_next;
                     out.push(Action::PointerMove { x, y });
-                    out.push(Action::PointerButton {
-                        right: self.pointer_right,
-                        down: true,
-                    });
+                    if self.pointer_middle {
+                        out.push(Action::PointerMiddle(true));
+                    } else {
+                        out.push(Action::PointerButton {
+                            right: self.pointer_right,
+                            down: true,
+                        });
+                    }
                 }
             }
         }
@@ -803,12 +1086,39 @@ impl TouchControls {
 
     fn menu_button(&mut self, button: Button, now: f64) -> Vec<Action> {
         match button {
+            Button::MenuHotbar(_)
+            | Button::MenuSwapHands
+            | Button::MenuDrop
+            | Button::MenuDropStack
+            | Button::MenuClone
+            | Button::MenuCollect => {
+                self.pending_menu = if self.pending_menu == Some(button) {
+                    None
+                } else {
+                    Some(button)
+                };
+                self.right_next = false;
+                self.middle_next = false;
+                Vec::new()
+            }
             Button::Shift => {
                 self.shift = !self.shift;
                 vec![Action::Shift(self.shift)]
             }
+            Button::Control => {
+                self.control = !self.control;
+                vec![Action::Control(self.control)]
+            }
             Button::RightClick => {
+                self.pending_menu = None;
                 self.right_next = !self.right_next;
+                self.middle_next = false;
+                Vec::new()
+            }
+            Button::MenuMiddleClick => {
+                self.pending_menu = None;
+                self.middle_next = !self.middle_next;
+                self.right_next = false;
                 Vec::new()
             }
             Button::ScrollUp => {
@@ -820,8 +1130,9 @@ impl TouchControls {
                 vec![Action::Scroll(-1.0)]
             }
             other => {
-                self.held.push(other);
-                vec![Action::Press(other)]
+                let mut out = Vec::new();
+                self.press_button(other, &mut out);
+                out
             }
         }
     }
@@ -841,6 +1152,16 @@ impl TouchControls {
                 // their pointer). A world hold ends before the press.
                 if self.mode == Mode::Playing
                     && let Some(button) = self.button_at(x, y)
+                    && matches!(
+                        button,
+                        Button::Break
+                            | Button::Place
+                            | Button::Jump
+                            | Button::Sneak
+                            | Button::Sprint
+                            | Button::FlyUp
+                            | Button::FlyDown
+                    )
                 {
                     if self.fingers[i].world == World::Breaking {
                         self.fingers[i].world = World::Looking;
@@ -1000,12 +1321,17 @@ impl TouchControls {
                 }
             }
             Role::Pointer => {
-                out.push(Action::PointerButton {
-                    right: self.pointer_right,
-                    down: false,
-                });
-                if self.pointer_right {
-                    self.right_next = false;
+                if self.pointer_middle {
+                    out.push(Action::PointerMiddle(false));
+                    self.middle_next = false;
+                } else {
+                    out.push(Action::PointerButton {
+                        right: self.pointer_right,
+                        down: false,
+                    });
+                    if self.pointer_right {
+                        self.right_next = false;
+                    }
                 }
             }
             Role::Look => {
@@ -1032,6 +1358,16 @@ impl TouchControls {
     /// enough, and repeats a held scroll button.
     pub fn update(&mut self, now: f64) -> Vec<Action> {
         let mut out = Vec::new();
+        if let Some((phase, at)) = self.fly_pulse
+            && now >= at
+        {
+            if phase == 2 {
+                self.press_button(Button::Jump, &mut out);
+            } else {
+                out.extend(self.release_button(Button::Jump));
+            }
+            self.fly_pulse = (phase < 3).then_some((phase + 1, now + 0.08));
+        }
         if self.mode == Mode::Playing && self.world_touch {
             for i in 0..self.fingers.len() {
                 let finger = &self.fingers[i];
@@ -1043,9 +1379,6 @@ impl TouchControls {
                     self.press_button(Button::Break, &mut out);
                 }
             }
-        }
-        if self.mode != Mode::Menu {
-            return out;
         }
         for finger in &self.fingers {
             let Role::Button(button) = finger.role else {
@@ -1124,6 +1457,27 @@ mod tests {
         }
     }
 
+    fn phone() -> Screen {
+        Screen {
+            width: 2532.0,
+            height: 1170.0,
+            density: 3.0,
+            hotbar: Rect {
+                x: 902.0,
+                y: 1012.0,
+                w: 728.0,
+                h: 88.0,
+            },
+            slot: 80.0,
+            insets: Insets {
+                left: 141.0,
+                right: 141.0,
+                top: 0.0,
+                bottom: 63.0,
+            },
+        }
+    }
+
     fn rect_of(c: &TouchControls, button: Button) -> Rect {
         c.view()
             .buttons
@@ -1135,8 +1489,8 @@ mod tests {
 
     #[test]
     fn every_control_fits_on_every_screen_and_none_overlap() {
-        for screen in [cover(), unfolded(), portrait()] {
-            for mode in [Mode::Playing, Mode::Menu] {
+        for screen in [cover(), unfolded(), portrait(), phone()] {
+            for mode in [Mode::Playing, Mode::Inventory, Mode::Menu] {
                 let mut c = TouchControls::new(Layout::default(), screen);
                 c.set_mode(mode);
                 let view = c.view();
@@ -1316,10 +1670,10 @@ mod tests {
     fn stick_and_look_work_together() {
         let mut c = TouchControls::new(Layout::default(), cover());
         c.touch(1, Phase::Started, 400.0, 600.0, 0.0);
-        c.touch(2, Phase::Started, 1800.0, 300.0, 0.0);
+        c.touch(2, Phase::Started, 1400.0, 400.0, 0.0);
         let r = c.view().stick.radius;
         assert!(!c.touch(1, Phase::Moved, 400.0, 600.0 - r, 0.1).is_empty());
-        let out = c.touch(2, Phase::Moved, 1900.0, 300.0, 0.1);
+        let out = c.touch(2, Phase::Moved, 1500.0, 400.0, 0.1);
         assert!(matches!(out[0], Action::Look { .. }));
         // Lifting the looking finger leaves the stick going.
         c.touch(2, Phase::Ended, 0.0, 0.0, 0.2);
@@ -1382,19 +1736,19 @@ mod tests {
         c.touch(2, Phase::Started, 400.0, 600.0, 0.0);
         let r = c.view().stick.radius;
         c.touch(2, Phase::Moved, 400.0, 600.0 - r * 1.2, 0.1);
-        let out = c.set_mode(Mode::Menu);
+        let out = c.set_mode(Mode::Inventory);
         assert!(out.contains(&Action::Release(Button::Break)), "{out:?}");
         assert!(out.contains(&Action::Move([0.0; 2])), "{out:?}");
         assert!(out.contains(&Action::Sprint(false)), "{out:?}");
         assert!(!c.active());
         assert_eq!(c.move_vector(), None);
-        assert!(c.set_mode(Mode::Menu).is_empty());
+        assert!(c.set_mode(Mode::Inventory).is_empty());
     }
 
     #[test]
     fn a_menu_tap_is_a_left_click_at_the_finger() {
         let mut c = TouchControls::new(Layout::default(), cover());
-        c.set_mode(Mode::Menu);
+        c.set_mode(Mode::Inventory);
         let out = c.touch(1, Phase::Started, 1200.0, 450.0, 0.0);
         assert_eq!(
             out,
@@ -1432,7 +1786,7 @@ mod tests {
     #[test]
     fn the_right_click_toggle_applies_to_one_tap() {
         let mut c = TouchControls::new(Layout::default(), cover());
-        c.set_mode(Mode::Menu);
+        c.set_mode(Mode::Inventory);
         let toggle = rect_of(&c, Button::RightClick).centre();
         assert!(
             c.touch(1, Phase::Started, toggle.0, toggle.1, 0.0)
@@ -1474,7 +1828,7 @@ mod tests {
     #[test]
     fn the_shift_toggle_stays_until_tapped_again() {
         let mut c = TouchControls::new(Layout::default(), cover());
-        c.set_mode(Mode::Menu);
+        c.set_mode(Mode::Inventory);
         let shift = rect_of(&c, Button::Shift).centre();
         assert_eq!(
             c.touch(1, Phase::Started, shift.0, shift.1, 0.0),
@@ -1496,7 +1850,7 @@ mod tests {
     #[test]
     fn scroll_buttons_repeat_while_held() {
         let mut c = TouchControls::new(Layout::default(), cover());
-        c.set_mode(Mode::Menu);
+        c.set_mode(Mode::Inventory);
         let down = rect_of(&c, Button::ScrollDown).centre();
         assert_eq!(
             c.touch(1, Phase::Started, down.0, down.1, 1.0),
@@ -1514,7 +1868,7 @@ mod tests {
     #[test]
     fn back_is_a_press_that_releases_with_the_finger() {
         let mut c = TouchControls::new(Layout::default(), cover());
-        c.set_mode(Mode::Menu);
+        c.set_mode(Mode::Inventory);
         let back = rect_of(&c, Button::Back).centre();
         assert_eq!(
             c.touch(1, Phase::Started, back.0, back.1, 0.0),
@@ -1731,27 +2085,334 @@ mod tests {
             bottom: 80.0,
         };
         let c = TouchControls::new(Layout::default(), screen);
-        // The bottom-right cluster clears the right and bottom insets
-        // (both beyond the layout's own 20 dp margin at this density).
-        let brk = rect_of(&c, Button::Break);
-        assert!(
-            (brk.x + brk.w - (screen.width - 120.0)).abs() < 0.01,
-            "{brk:?}"
-        );
-        assert!(
-            (brk.y + brk.h - (screen.height - 80.0)).abs() < 0.01,
-            "{brk:?}"
-        );
-        // The top row clears the top, and the stick rests clear of the left.
+        // Every hit target stays within the same safe rectangle as its drawing.
+        for button in c.view().buttons {
+            let r = button.rect;
+            assert!(r.x >= 100.0 && r.y >= 80.0, "{button:?}");
+            assert!(r.x + r.w <= screen.width - 120.0, "{button:?}");
+            assert!(r.y + r.h <= screen.height - 80.0, "{button:?}");
+        }
         let pause = rect_of(&c, Button::Pause);
-        assert!(
-            (pause.x - 100.0).abs() < 0.01 && (pause.y - 80.0).abs() < 0.01,
-            "{pause:?}"
-        );
+        assert!((pause.x + pause.w - (screen.width - 120.0)).abs() < 0.01);
+        assert!((pause.y - 80.0).abs() < 0.01);
         let stick = c.view().stick;
         assert!(
             (stick.base.0 - stick.radius - 100.0).abs() < 0.01,
             "{stick:?}"
         );
+    }
+    #[test]
+    fn all_world_buttons_dispatch_and_flight_is_the_existing_double_jump() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        for button in [
+            Button::Sprint,
+            Button::FlyUp,
+            Button::FlyDown,
+            Button::PickBlock,
+            Button::SwapHands,
+            Button::Perspective,
+            Button::SaveToolbar,
+            Button::LoadToolbar,
+            Button::QuickActions,
+            Button::Emote,
+            Button::PlayerList,
+        ] {
+            let (x, y) = rect_of(&c, button).centre();
+            assert_eq!(
+                c.touch(1, Phase::Started, x, y, 0.0),
+                vec![Action::Press(button)]
+            );
+            assert_eq!(
+                c.touch(1, Phase::Cancelled, x, y, 0.1),
+                vec![Action::Release(button)]
+            );
+        }
+        let (x, y) = rect_of(&c, Button::FlyToggle).centre();
+        assert_eq!(
+            c.touch(1, Phase::Started, x, y, 0.0),
+            vec![Action::Press(Button::Jump)]
+        );
+        assert!(c.touch(1, Phase::Ended, x, y, 0.01).is_empty());
+        assert_eq!(c.update(0.08), vec![Action::Release(Button::Jump)]);
+        assert_eq!(c.update(0.16), vec![Action::Press(Button::Jump)]);
+        assert_eq!(c.update(0.24), vec![Action::Release(Button::Jump)]);
+        assert!(c.update(1.0).is_empty());
+    }
+
+    #[test]
+    fn menu_shortcuts_preserve_the_slot_pointer_and_middle_drag_ends_on_cancel() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        c.set_mode(Mode::Inventory);
+        // Arm each operation, then tap the target. The shortcut must run at
+        // that slot with no normal click to pick up or displace its contents.
+        for button in [
+            Button::MenuSwapHands,
+            Button::MenuDrop,
+            Button::MenuDropStack,
+            Button::MenuClone,
+            Button::MenuCollect,
+            Button::MenuHotbar(0),
+            Button::MenuHotbar(8),
+        ] {
+            let (x, y) = rect_of(&c, button).centre();
+            assert!(c.touch(1, Phase::Started, x, y, 0.2).is_empty());
+            assert!(c.touch(1, Phase::Ended, x, y, 0.3).is_empty());
+            assert!(c.view().buttons.iter().any(|b| b.button == button && b.lit));
+            assert_eq!(
+                c.touch(2, Phase::Started, 1266.0, 500.0, 0.4),
+                vec![
+                    Action::PointerMove {
+                        x: 1266.0,
+                        y: 500.0
+                    },
+                    Action::Press(button),
+                    Action::Release(button)
+                ]
+            );
+            assert!(c.touch(2, Phase::Moved, 1300.0, 500.0, 0.5).is_empty());
+            assert!(c.touch(2, Phase::Ended, 1300.0, 500.0, 0.6).is_empty());
+            assert!(!c.view().buttons.iter().any(|b| b.button == button && b.lit));
+        }
+        let (x, y) = rect_of(&c, Button::MenuMiddleClick).centre();
+        assert!(c.touch(1, Phase::Started, x, y, 0.4).is_empty());
+        c.touch(1, Phase::Ended, x, y, 0.5);
+        assert_eq!(
+            c.touch(2, Phase::Started, 1200.0, 500.0, 0.6),
+            vec![
+                Action::PointerMove {
+                    x: 1200.0,
+                    y: 500.0
+                },
+                Action::PointerMiddle(true)
+            ]
+        );
+        assert_eq!(
+            c.touch(2, Phase::Moved, 1300.0, 500.0, 0.7),
+            vec![Action::PointerMove {
+                x: 1300.0,
+                y: 500.0
+            }]
+        );
+        assert_eq!(
+            c.touch(2, Phase::Cancelled, 1300.0, 500.0, 0.8),
+            vec![Action::PointerMiddle(false)]
+        );
+        assert!(
+            !c.view()
+                .buttons
+                .iter()
+                .any(|b| b.button == Button::MenuMiddleClick && b.lit)
+        );
+    }
+
+    #[test]
+    fn leaving_a_screen_releases_control_and_an_unfinished_flight_gesture() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        let (x, y) = rect_of(&c, Button::Control).centre();
+        assert_eq!(
+            c.touch(1, Phase::Started, x, y, 0.0),
+            vec![Action::Control(true)]
+        );
+        c.touch(1, Phase::Ended, x, y, 0.1);
+        let (x, y) = rect_of(&c, Button::FlyToggle).centre();
+        c.touch(2, Phase::Started, x, y, 0.2);
+        let actions = c.set_mode(Mode::Inventory);
+        assert!(actions.contains(&Action::Control(false)));
+        assert!(actions.contains(&Action::Release(Button::Jump)));
+        assert!(c.update(1.0).is_empty());
+    }
+    #[test]
+    fn shared_mining_holds_release_only_after_the_last_finger() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        let (x, y) = rect_of(&c, Button::Break).centre();
+        assert_eq!(
+            c.touch(1, Phase::Started, x, y, 0.0),
+            vec![Action::Press(Button::Break)]
+        );
+        assert!(c.touch(2, Phase::Started, x, y, 0.1).is_empty());
+        assert!(c.touch(1, Phase::Ended, x, y, 0.2).is_empty());
+        // A world hold joins the remaining dedicated mine-button finger.
+        c.touch(3, Phase::Started, 1500.0, 500.0, 0.3);
+        assert!(c.update(0.6).is_empty());
+        assert!(c.touch(2, Phase::Cancelled, x, y, 0.7).is_empty());
+        assert_eq!(
+            c.touch(3, Phase::Ended, 1500.0, 500.0, 0.8),
+            vec![Action::Release(Button::Break)]
+        );
+        c.touch(4, Phase::Started, x, y, 0.9);
+        c.touch(5, Phase::Started, x, y, 1.0);
+        assert_eq!(c.release_all(), vec![Action::Release(Button::Break)]);
+    }
+
+    #[test]
+    fn flight_gesture_does_not_release_a_jump_finger() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        let (x, y) = rect_of(&c, Button::Jump).centre();
+        c.touch(1, Phase::Started, x, y, 0.0);
+        let (fx, fy) = rect_of(&c, Button::FlyToggle).centre();
+        assert!(c.touch(2, Phase::Started, fx, fy, 0.0).is_empty());
+        assert!(c.update(0.08).is_empty());
+        assert!(c.update(0.16).is_empty());
+        assert!(c.update(0.24).is_empty());
+        assert_eq!(
+            c.touch(1, Phase::Ended, x, y, 0.3),
+            vec![Action::Release(Button::Jump)]
+        );
+    }
+
+    #[test]
+    fn a_world_look_cannot_slide_into_a_modifier_or_flight_toggle() {
+        for button in [Button::Control, Button::FlyToggle] {
+            let mut c = TouchControls::new(Layout::default(), phone());
+            c.touch(1, Phase::Started, 1500.0, 500.0, 0.0);
+            let (x, y) = rect_of(&c, button).centre();
+            let out = c.touch(1, Phase::Moved, x, y, 0.1);
+            assert!(
+                out.iter()
+                    .all(|action| matches!(action, Action::Look { .. }))
+            );
+            assert!(!c.view().buttons.iter().any(|b| b.button == button && b.lit));
+        }
+    }
+
+    #[test]
+    fn spectator_scroll_buttons_repeat_in_the_world() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        for (button, direction) in [(Button::ScrollUp, 1.0), (Button::ScrollDown, -1.0)] {
+            let (x, y) = rect_of(&c, button).centre();
+            assert_eq!(
+                c.touch(1, Phase::Started, x, y, 0.0),
+                vec![Action::Scroll(direction)]
+            );
+            assert!(c.update(0.2).is_empty());
+            assert_eq!(c.update(0.4), vec![Action::Scroll(direction)]);
+            c.touch(1, Phase::Ended, x, y, 0.5);
+            assert!(c.update(0.6).is_empty());
+        }
+    }
+    #[test]
+    fn an_armed_inventory_action_can_cancel_and_never_leaks_to_another_screen() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        c.set_mode(Mode::Inventory);
+        let (x, y) = rect_of(&c, Button::MenuDropStack).centre();
+        for id in [1, 2] {
+            assert!(c.touch(id, Phase::Started, x, y, 0.0).is_empty());
+            assert!(c.touch(id, Phase::Ended, x, y, 0.1).is_empty());
+        }
+        assert_eq!(
+            c.touch(3, Phase::Started, 1266.0, 500.0, 0.2),
+            vec![
+                Action::PointerMove {
+                    x: 1266.0,
+                    y: 500.0
+                },
+                Action::PointerButton {
+                    right: false,
+                    down: true
+                }
+            ]
+        );
+        c.touch(3, Phase::Ended, 1266.0, 500.0, 0.3);
+        c.touch(4, Phase::Started, x, y, 0.4);
+        c.touch(4, Phase::Ended, x, y, 0.5);
+        assert!(c.release_all().is_empty());
+        assert!(
+            !c.view()
+                .buttons
+                .iter()
+                .any(|b| b.button == Button::MenuDropStack && b.lit)
+        );
+        let actions = c.touch(5, Phase::Started, 1266.0, 500.0, 0.6);
+        assert!(actions.contains(&Action::PointerButton {
+            right: false,
+            down: true
+        }));
+        assert!(!actions.contains(&Action::Press(Button::MenuDropStack)));
+        c.touch(5, Phase::Ended, 1266.0, 500.0, 0.7);
+        c.touch(6, Phase::Started, x, y, 0.8);
+        c.set_mode(Mode::Playing);
+        c.set_mode(Mode::Inventory);
+        let actions = c.touch(7, Phase::Started, 1266.0, 500.0, 0.9);
+        assert!(actions.contains(&Action::PointerButton {
+            right: false,
+            down: true
+        }));
+    }
+    #[test]
+    fn portrait_menu_leaves_the_full_width_inventory_and_recipe_book_clear() {
+        let mut screens = [
+            portrait(),
+            Screen {
+                width: 1170.0,
+                height: 2532.0,
+                density: 3.0,
+                slot: 80.0,
+                ..Screen::plain(1170.0, 2532.0, 3.0)
+            },
+        ];
+        screens[1].insets = Insets {
+            top: 141.0,
+            bottom: 63.0,
+            ..Insets::default()
+        };
+        for screen in screens {
+            let mut c = TouchControls::new(Layout::default(), screen);
+            c.set_mode(Mode::Inventory);
+            let gui_scale = screen.slot / 20.0;
+            let inventory_top = (screen.height - 166.0 * gui_scale) / 2.0;
+            let inventory_bottom = inventory_top + 166.0 * gui_scale;
+            for button in c.view().buttons {
+                let r = button.rect;
+                if matches!(button.button, Button::MenuHotbar(_)) {
+                    assert!(r.y >= inventory_bottom, "{button:?} covers the inventory");
+                } else {
+                    assert!(
+                        r.y + r.h <= inventory_top,
+                        "{button:?} covers the recipe book"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn generic_menus_show_only_navigation_and_keep_touch_pointer_input() {
+        let mut c = TouchControls::new(Layout::default(), phone());
+        c.set_mode(Mode::Menu);
+        let buttons: Vec<_> = c.view().buttons.into_iter().map(|b| b.button).collect();
+        assert_eq!(
+            buttons,
+            vec![
+                Button::Back,
+                Button::ScrollUp,
+                Button::ScrollDown,
+                Button::Keyboard
+            ]
+        );
+        assert_eq!(
+            c.touch(1, Phase::Started, 1266.0, 500.0, 0.0),
+            vec![
+                Action::PointerMove {
+                    x: 1266.0,
+                    y: 500.0
+                },
+                Action::PointerButton {
+                    right: false,
+                    down: true
+                }
+            ]
+        );
+        assert_eq!(
+            c.touch(1, Phase::Ended, 1266.0, 500.0, 0.1),
+            vec![Action::PointerButton {
+                right: false,
+                down: false
+            }]
+        );
+        let (x, y) = rect_of(&c, Button::ScrollDown).centre();
+        assert_eq!(
+            c.touch(2, Phase::Started, x, y, 0.2),
+            vec![Action::Scroll(-1.0)]
+        );
+        assert_eq!(c.update(0.61), vec![Action::Scroll(-1.0)]);
     }
 }
