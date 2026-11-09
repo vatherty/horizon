@@ -356,6 +356,52 @@ impl Screen {
     }
 }
 
+/// A point in the window's full pixel space (the "panel"), mapped into the
+/// space of a screen laid out at `screen` size. The two spaces differ where
+/// the surface spans less than the window: on iOS the surface covers only
+/// the safe area inside the panel, the window reports fingers in panel
+/// pixels, and the surface is stretched over the panel when presented — so
+/// a finger and the control it is seen on meet only after this mapping.
+/// Where the spaces agree (a desktop window, Android) it is the identity.
+pub fn panel_point(panel: (f32, f32), screen: (f32, f32), x: f32, y: f32) -> (f32, f32) {
+    let axis = |full: f32, laid: f32, v: f32| if full > 0.0 { v * laid / full } else { v };
+    (axis(panel.0, screen.0, x), axis(panel.1, screen.1, y))
+}
+
+impl Insets {
+    /// The safe-area insets of a window whose safe area starts at `position`
+    /// and spans `inner` inside a full window of `outer` (all panel pixels),
+    /// expressed in a layout space of `screen` size: what the panel extends
+    /// past the safe area on each side, scaled into the space with
+    /// [`panel_point`]. `None` when the numbers describe no sane safe area:
+    /// an inset pair eating half the panel is the platform reporting
+    /// positions, not insets.
+    pub fn from_panel(
+        position: (f32, f32),
+        inner: (f32, f32),
+        outer: (f32, f32),
+        screen: (f32, f32),
+    ) -> Option<Insets> {
+        let panel = Insets {
+            left: position.0.max(0.0),
+            top: position.1.max(0.0),
+            right: (outer.0 - position.0 - inner.0).max(0.0),
+            bottom: (outer.1 - position.1 - inner.1).max(0.0),
+        };
+        if panel.left + panel.right >= outer.0 / 2.0 || panel.top + panel.bottom >= outer.1 / 2.0 {
+            return None;
+        }
+        let (left, top) = panel_point(outer, screen, panel.left, panel.top);
+        let (right, bottom) = panel_point(outer, screen, panel.right, panel.bottom);
+        Some(Insets {
+            left,
+            top,
+            right,
+            bottom,
+        })
+    }
+}
+
 /// Where everything is, for one screen.
 #[derive(Clone, Debug, PartialEq)]
 struct Arrangement {
@@ -1478,6 +1524,50 @@ mod tests {
         }
     }
 
+    /// The same iPhone as the game actually builds it: winit reports the
+    /// safe area as the window (inner position (141, 0), inner size
+    /// 2250 x 1110) inside the 2532 x 1170 panel, so the controls are laid
+    /// out on the 2250 x 1110 surface, with the hotbar the HUD batch of GUI
+    /// scale 4 draws for it (bottom inset 15 GUI pixels) and the insets
+    /// `Insets::from_panel` makes of the window's numbers.
+    fn iphone() -> Screen {
+        let panel = (2532.0, 1170.0);
+        let surface = (2250.0, 1110.0);
+        Screen {
+            width: surface.0,
+            height: surface.1,
+            density: 3.0,
+            hotbar: Rect {
+                x: 762.0,
+                y: 964.0,
+                w: 728.0,
+                h: 88.0,
+            },
+            slot: 80.0,
+            insets: Insets::from_panel((141.0, 0.0), surface, panel, surface)
+                .expect("the iPhone's safe area is sane"),
+        }
+    }
+
+    /// A tap as it now reaches the controls: the layout point `at` is what
+    /// the player sees, stretched onto the panel; the finger is reported in
+    /// panel pixels and mapped back into the layout's space at the door.
+    fn panel_tap(
+        c: &mut TouchControls,
+        screen: Screen,
+        id: u64,
+        at: (f32, f32),
+        now: f64,
+    ) -> Vec<Action> {
+        let panel = (2532.0, 1170.0);
+        let seen = (
+            at.0 * panel.0 / screen.width,
+            at.1 * panel.1 / screen.height,
+        );
+        let (x, y) = panel_point(panel, (screen.width, screen.height), seen.0, seen.1);
+        c.touch(id, Phase::Started, x, y, now)
+    }
+
     fn rect_of(c: &TouchControls, button: Button) -> Rect {
         c.view()
             .buttons
@@ -2100,6 +2190,84 @@ mod tests {
             (stick.base.0 - stick.radius - 100.0).abs() < 0.01,
             "{stick:?}"
         );
+    }
+
+    #[test]
+    fn panel_mapping_is_the_identity_where_the_spaces_agree() {
+        assert_eq!(
+            panel_point((1920.0, 1080.0), (1920.0, 1080.0), 700.0, 300.0),
+            (700.0, 300.0)
+        );
+        // And it undoes the panel stretch exactly: a layout point, seen where
+        // the presentation puts it, maps back onto itself.
+        let screen = iphone();
+        let panel = (2532.0, 1170.0);
+        let at = (2000.0, 500.0);
+        let seen = (
+            at.0 * panel.0 / screen.width,
+            at.1 * panel.1 / screen.height,
+        );
+        let back = panel_point(panel, (screen.width, screen.height), seen.0, seen.1);
+        assert!((back.0 - at.0).abs() < 0.01 && (back.1 - at.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn iphone_insets_are_the_panels_scaled_into_the_surface() {
+        let insets = iphone().insets;
+        // 141 panel pixels at each side and 60 below, scaled by 2250/2532
+        // and 1110/1170 — not the 0 the surface-based basis made of the
+        // right side by subtracting the safe width from itself.
+        assert!((insets.left - 125.3).abs() < 0.1, "{insets:?}");
+        assert!((insets.right - 125.3).abs() < 0.1, "{insets:?}");
+        assert_eq!(insets.top, 0.0);
+        assert!((insets.bottom - 56.9).abs() < 0.1, "{insets:?}");
+        // A "safe area" starting past half the panel is no safe area.
+        assert!(
+            Insets::from_panel(
+                (1300.0, 0.0),
+                (2250.0, 1110.0),
+                (2532.0, 1170.0),
+                (2250.0, 1110.0)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn iphone_taps_land_on_the_controls_they_are_seen_on() {
+        let screen = iphone();
+        let mut c = TouchControls::new(Layout::default(), screen);
+        // Place, far right: read in panel pixels unmapped, this tap landed
+        // some 260 px further right still — past the button altogether.
+        let place = rect_of(&c, Button::Place).centre();
+        assert_eq!(
+            panel_tap(&mut c, screen, 1, place, 0.0),
+            vec![Action::Press(Button::Place)]
+        );
+        assert_eq!(
+            c.touch(1, Phase::Ended, 0.0, 0.0, 0.1),
+            vec![Action::Release(Button::Place)]
+        );
+        // The hotbar's seventh slot: unmapped, this tap selected the ninth.
+        let slot = 6;
+        let unit = screen.slot / 20.0;
+        let seventh = (
+            screen.hotbar.x + unit * (1.0 + 20.0 * slot as f32 + 10.0),
+            screen.hotbar.y + screen.hotbar.h / 2.0,
+        );
+        assert_eq!(
+            panel_tap(&mut c, screen, 2, seventh, 0.2),
+            vec![Action::SelectSlot(slot)]
+        );
+        // The stick's home on the left is unmoved: a finger there takes the
+        // stick and presses nothing.
+        let home = c.view().stick.base;
+        let out = panel_tap(&mut c, screen, 3, home, 0.3);
+        assert!(
+            out.iter().all(|a| !matches!(a, Action::Press(_))),
+            "{out:?}"
+        );
+        assert!(c.view().stick.active);
     }
     #[test]
     fn all_world_buttons_dispatch_and_flight_is_the_existing_double_jump() {
