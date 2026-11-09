@@ -73,8 +73,9 @@ impl Default for TouchState {
 /// The window's safe-area insets in physical pixels, for the touch controls
 /// to keep off the unsafe edges. Only iOS has any: winit exposes no safe-area
 /// call, but its iOS backend defines the window's inner position and size
-/// from the safe area, so the insets are what the full surface extends past
-/// them on each side. If the platform reports nothing sane, landscape
+/// from the safe area, so the insets are what the full window (the panel)
+/// extends past them on each side, scaled into the surface's space the
+/// controls are laid out in. If the platform reports nothing sane, landscape
 /// iPhones keep fixed insets instead (24 dp at the sides, 16 dp below).
 #[cfg(target_os = "ios")]
 fn safe_insets(
@@ -87,15 +88,13 @@ fn safe_insets(
         && let Ok(position) = window.inner_position()
     {
         let inner = window.inner_size();
-        let insets = controls::Insets {
-            left: (position.x as f32).max(0.0),
-            top: (position.y as f32).max(0.0),
-            right: (width - position.x as f32 - inner.width as f32).max(0.0),
-            bottom: (height - position.y as f32 - inner.height as f32).max(0.0),
-        };
-        // A sane safe area never eats half the screen; anything wider is
-        // the platform reporting positions, not insets.
-        if insets.left + insets.right < width / 2.0 && insets.top + insets.bottom < height / 2.0 {
+        let outer = window.outer_size();
+        if let Some(insets) = controls::Insets::from_panel(
+            (position.x as f32, position.y as f32),
+            (inner.width as f32, inner.height as f32),
+            (outer.width as f32, outer.height as f32),
+            (width, height),
+        ) {
             return insets;
         }
     }
@@ -119,13 +118,41 @@ fn safe_insets(
     controls::Insets::default()
 }
 
+/// A touch position in the window's full pixels, mapped into the layout
+/// space of `layout` size: winit reports fingers against the whole window,
+/// but on iOS the surface — everything the game lays out and draws — spans
+/// only the safe area inside it, and is stretched over the window when
+/// presented. The mapping is the identity where the two spaces agree.
+fn panel_touch_point(
+    panel: (f32, f32),
+    layout: (f32, f32),
+    position: PhysicalPosition<f64>,
+) -> PhysicalPosition<f64> {
+    let (x, y) = controls::panel_point(panel, layout, position.x as f32, position.y as f32);
+    PhysicalPosition::new(f64::from(x), f64::from(y))
+}
+
 /// A finger as the mouse: the events a pointer at its place and a left button would send. The
-/// startup menu, shown while the resources load, takes only a mouse.
-pub(super) fn touch_as_mouse(touch: winit::event::Touch) -> Vec<WindowEvent> {
+/// startup menu, shown while the resources load, takes only a mouse. The finger's place is
+/// mapped from the window's full pixels into the surface's space (see [`panel_touch_point`]).
+pub(super) fn touch_as_mouse(
+    touch: winit::event::Touch,
+    window: Option<&winit::window::Window>,
+) -> Vec<WindowEvent> {
     let device_id = touch.device_id;
+    let mut location = touch.location;
+    if let Some(window) = window {
+        let inner = window.inner_size();
+        let outer = window.outer_size();
+        location = panel_touch_point(
+            (outer.width as f32, outer.height as f32),
+            (inner.width as f32, inner.height as f32),
+            location,
+        );
+    }
     let at = WindowEvent::CursorMoved {
         device_id,
-        position: touch.location,
+        position: location,
     };
     let button = |state| WindowEvent::MouseInput {
         device_id,
@@ -317,6 +344,31 @@ impl Game<'_> {
         }
     }
 
+    /// A finger's place in the surface's pixels, the space the touch controls
+    /// are laid out in (see `panel_touch_point`). Fingers are mapped here,
+    /// once, at the door; everything downstream — the controls' hit tests,
+    /// look drags, and the pointer moves they synthesise for menus — already
+    /// speaks this space, as does a real mouse, so nothing else converts.
+    /// Off the touch platforms the spaces are one and the point passes
+    /// through untouched.
+    fn touch_layout_point(&self, position: PhysicalPosition<f64>) -> PhysicalPosition<f64> {
+        if !cfg!(any(target_os = "ios", target_os = "android")) {
+            return position;
+        }
+        let Some(window) = self.window.as_deref() else {
+            return position;
+        };
+        let outer = window.outer_size();
+        let layout = match &self.renderer {
+            Some(r) => (r.config.width as f32, r.config.height as f32),
+            None => {
+                let inner = window.inner_size();
+                (inner.width as f32, inner.height as f32)
+            }
+        };
+        panel_touch_point((outer.width as f32, outer.height as f32), layout, position)
+    }
+
     /// A finger touched the window, moved on it or left it.
     pub(super) fn touch_event(
         &mut self,
@@ -339,13 +391,11 @@ impl Game<'_> {
             TouchPhase::Cancelled => Phase::Cancelled,
         };
         let now = self.touch.since.elapsed().as_secs_f64();
-        let actions = self.touch.controls.touch(
-            touch.id,
-            phase,
-            touch.location.x as f32,
-            touch.location.y as f32,
-            now,
-        );
+        let at = self.touch_layout_point(touch.location);
+        let actions = self
+            .touch
+            .controls
+            .touch(touch.id, phase, at.x as f32, at.y as f32, now);
         self.touch_actions(event_loop, actions);
     }
 
