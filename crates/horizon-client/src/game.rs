@@ -22355,7 +22355,7 @@ impl Loading {
         // with the game).
         let events = match event {
             WindowEvent::Touch(touch) if cfg!(any(target_os = "android", target_os = "ios")) => {
-                touch::touch_as_mouse(touch)
+                touch::touch_as_mouse(touch, self.window.as_deref())
             }
             event => vec![event],
         };
